@@ -1,0 +1,9 @@
+[
+  {
+    "id": "native-deepseek-ai-dsh-tool-todo",
+    "name": "@deepseek-ai/dsh-tool-todo",
+    "config": {
+      "allowParallelInProgress": false
+    }
+  }
+]

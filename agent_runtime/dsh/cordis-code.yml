@@ -1,0 +1,79 @@
+# ATRI's owner-only self-improvement runtime. Filesystem access is provided by
+# the local ATRI host plugin: non-sensitive project source is readable, while
+# writes are limited to config/agent and the tools/agent, tools/draw, and
+# tools/fortune capability folders.
+# No arbitrary shell, web, subagent, or Discord-send tool exists. Sequential
+# model/tool calls are allowed; only parallel tool execution is disabled.
+
+- id: sdk-jsonrpc-server
+  name: './plugins/atri-sdk-jsonrpc-server/index.js'
+  config:
+    maxTokensAsSuccess: false
+
+- id: llm
+  name: '@deepseek-ai/dsh-llm-pi-ai'
+  config:
+    providers:
+      atri-gateway:
+        displayName: ATRI configured gateway
+        apiKeyEnv: ATRI_AGENT_CODE_API_KEY
+        api: openai-completions
+        baseURL: !!js process.env.ATRI_AGENT_CODE_BASE_URL ?? 'http://127.0.0.1:1/v1'
+        defaultInput: [text]
+        streamIdleTimeoutMs: !!js Number(process.env.OPENAI_TIMEOUT ?? 180) * 1000
+        retryPolicy:
+          mode: normal
+          # Keep retries host-controlled so maintenance failures cannot burst.
+          maxRetries: 0
+        models:
+          - id: !!js process.env.ATRI_AGENT_CODE_MODEL ?? 'unconfigured-model'
+            contextWindow: !!js Number(process.env.ATRI_AGENT_CODE_PROVIDER_CONTEXT_WINDOW ?? process.env.ATRI_DSH_PROVIDER_CONTEXT_WINDOW ?? 1048576)
+
+- id: llm-retry
+  name: '@deepseek-ai/dsh-llm-retry'
+
+- id: agent-spine
+  name: '@deepseek-ai/dsh-agent-spine-demo'
+  config:
+    includeHarnessIdentity: false
+    includeRuntimeContext: true
+    persona: !!js process.env.ATRI_DSH_SYSTEM_PROMPT ?? 'You are ATRI in owner-authorized code maintenance mode.'
+    workspaceContext: false
+    skills:
+      enabled: false
+    toolBash: false
+    toolJobs: false
+    goals: false
+    maxParallelToolCalls: 1
+
+- id: sessions
+  name: '@deepseek-ai/dsh-session-persistence-jsonl'
+  config:
+    root: !!js process.env.DSH_SESSION_ROOT
+    compression: none
+
+- id: session-checkpoints
+  name: '@deepseek-ai/dsh-session-checkpoint-policy'
+
+- id: token-meter
+  name: '@deepseek-ai/dsh-token-meter'
+
+- id: tool-result-pruner
+  name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+  config:
+    thresholdChars: 8000
+    headChars: 5000
+    tailChars: 1500
+
+- id: compaction
+  name: '@deepseek-ai/dsh-compaction-basic'
+  config:
+    thresholdRatio: !!js Math.min(0.95, Math.max(0.01, (Number(process.env.ATRI_DSH_CONTEXT_WINDOW ?? 140000) * 0.72) / Number(process.env.ATRI_AGENT_CODE_PROVIDER_CONTEXT_WINDOW ?? process.env.ATRI_DSH_PROVIDER_CONTEXT_WINDOW ?? 1048576)))
+    retainTokens: !!js Math.floor(Number(process.env.ATRI_DSH_CONTEXT_WINDOW ?? 140000) * 0.18)
+    maxTokens: 30000
+    compactionRetries: 1
+    maxOverflowRetries: 1
+    auto: true
+
+- id: atri-tools
+  name: './plugins/atri-tools/index.js'

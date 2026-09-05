@@ -1,0 +1,12 @@
+title = "Discord bot secret scanning"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+id = "synthetic-dsh-tenant-id"
+description = "Known synthetic tenant identifier used by the DSH process tests"
+regexTarget = "secret"
+regexes = [
+  '''^t_0123456789abcdef0123456789abcdef01234567$''',
+]

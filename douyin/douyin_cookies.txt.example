@@ -1,0 +1,6 @@
+# Export cookies for https://www.douyin.com/ in Netscape cookies.txt format,
+# then save the real file as:
+#
+#   config/credentials/douyin_cookies.txt
+#
+# The real cookie file is ignored by git.
