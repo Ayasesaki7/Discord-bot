@@ -5,6 +5,8 @@
 __pycache__/
 *.py[cod]
 *.log
+*.jsonl
+*.jsonl.*
 *.pid
 *.bak
 *.backup
@@ -28,6 +30,13 @@ punishments/data/
 music/qqmusic_cookie.txt
 chat/agent/data/
 chat/draw/data/
+# DSH conversations normally live outside the repository. These rules also
+# protect common project-local overrides and generated session metadata.
+agent-sessions/
+agent_sessions/
+.dsh/
+**/_session-revisions.json
+**/agent-session.key
 agent_runtime/dsh/node_modules/
 agent_workspace/
 plugin_staging/
