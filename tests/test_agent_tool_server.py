@@ -16,20 +16,6 @@ class AgentToolServerTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self) -> None:
         await self.server.close()
 
-    async def post(self, *, token: str, session_id: str) -> tuple[int, dict | str]:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"{self.server.endpoint}/v1/tools/draw-image",
-                headers={"Authorization": f"Bearer {token}"},
-                json={
-                    "sessionId": session_id,
-                    "arguments": {"request": "draw a blue flower"},
-                },
-            ) as response:
-                if response.content_type == "application/json":
-                    return response.status, await response.json()
-                return response.status, await response.text()
-
     async def post_project(
         self,
         *,
@@ -68,28 +54,12 @@ class AgentToolServerTests(unittest.IsolatedAsyncioTestCase):
                     return response.status, await response.json()
                 return response.status, await response.text()
 
-    async def post_draw_profile(
-        self,
-        *,
-        token: str,
-        session_id: str,
-    ) -> tuple[int, dict | str]:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"{self.server.endpoint}/v1/tools/draw-profile",
-                headers={"Authorization": f"Bearer {token}"},
-                json={"sessionId": session_id},
-            ) as response:
-                if response.content_type == "application/json":
-                    return response.status, await response.json()
-                return response.status, await response.text()
-
     async def post_maintenance(
         self,
         *,
         token: str,
         session_id: str,
-        task: str = "improve the drawing tool",
+        task: str = "improve the music tool",
     ) -> tuple[int, dict | str]:
         async with aiohttp.ClientSession() as session:
             async with session.post(
@@ -138,51 +108,25 @@ class AgentToolServerTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.01)
         self.fail("maintenance job did not finish")
 
-    async def post_fortune(
-        self,
-        *,
-        token: str,
-        session_id: str,
-    ) -> tuple[int, dict | str]:
+    async def test_removed_drawing_routes_are_unavailable(self) -> None:
         async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"{self.server.endpoint}/v1/tools/daily-fortune",
-                headers={"Authorization": f"Bearer {token}"},
-                json={"sessionId": session_id, "arguments": {}},
-            ) as response:
-                if response.content_type == "application/json":
-                    return response.status, await response.json()
-                return response.status, await response.text()
+            for route in ("draw-image", "draw-profile"):
+                async with session.post(
+                    f"{self.server.endpoint}/v1/tools/{route}",
+                    headers={"Authorization": f"Bearer {self.server.token}"},
+                    json={"sessionId": "session-1", "arguments": {}},
+                ) as response:
+                    self.assertEqual(response.status, 404)
+        self.assertFalse(hasattr(self.server, "bind_draw_turn"))
+        self.assertFalse(hasattr(self.server, "bind_draw_profile_turn"))
 
     async def test_rejects_wrong_token(self) -> None:
-        status, _body = await self.post(token="wrong", session_id="session-1")
+        status, _body = await self.post_discord(token="wrong", session_id="session-1")
         self.assertEqual(status, 401)
 
     async def test_rejects_session_without_active_discord_turn(self) -> None:
-        status, _body = await self.post(token=self.server.token, session_id="session-1")
+        status, _body = await self.post_discord(token=self.server.token, session_id="session-1")
         self.assertEqual(status, 403)
-
-    async def test_dispatches_only_to_exact_bound_session(self) -> None:
-        received: list[dict[str, object]] = []
-
-        async def handler(arguments: dict[str, object]) -> dict[str, object]:
-            received.append(arguments)
-            return {"status": "sent", "summary": "image sent"}
-
-        async with self.server.bind_draw_turn("session-private", handler):
-            wrong_status, _ = await self.post(
-                token=self.server.token,
-                session_id="session-public",
-            )
-            good_status, body = await self.post(
-                token=self.server.token,
-                session_id="session-private",
-            )
-
-        self.assertEqual(wrong_status, 403)
-        self.assertEqual(good_status, 200)
-        self.assertEqual(body, {"status": "sent", "summary": "image sent"})
-        self.assertEqual(received, [{"request": "draw a blue flower"}])
 
     async def test_project_tools_require_separate_owner_authorized_binding(self) -> None:
         received: list[tuple[str, dict[str, object]]] = []
@@ -241,24 +185,6 @@ class AgentToolServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(body["summary"], "current guild")
         self.assertEqual(received, [("context", {})])
 
-    async def test_draw_profile_is_bound_to_exact_requester_session(self) -> None:
-        async def handler(_arguments: dict[str, object]) -> dict[str, object]:
-            return {"summary": "one artist", "content": "{}", "truncated": False}
-
-        async with self.server.bind_draw_profile_turn("session-user", handler):
-            wrong_status, _ = await self.post_draw_profile(
-                token=self.server.token,
-                session_id="session-other",
-            )
-            good_status, body = await self.post_draw_profile(
-                token=self.server.token,
-                session_id="session-user",
-            )
-
-        self.assertEqual(wrong_status, 403)
-        self.assertEqual(good_status, 200)
-        self.assertEqual(body["summary"], "one artist")
-
     async def test_natural_maintenance_requires_exact_owner_turn_binding(self) -> None:
         received: list[str] = []
 
@@ -295,7 +221,7 @@ class AgentToolServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(wrong_status, 403)
         self.assertEqual(good_status, 200)
         self.assertEqual(body["summary"], "tool updated")
-        self.assertEqual(received, ["improve the drawing tool"])
+        self.assertEqual(received, ["improve the music tool"])
 
     async def test_maintenance_submission_returns_while_job_is_running(self) -> None:
         release = asyncio.Event()
@@ -379,34 +305,15 @@ class AgentToolServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(counts["toolRequests"], 1)
         self.assertIsInstance(results[0], asyncio.CancelledError)
 
-    async def test_fortune_identity_is_fixed_by_exact_turn_binding(self) -> None:
-        calls = 0
-
-        async def handler() -> dict[str, object]:
-            nonlocal calls
-            calls += 1
-            return {
-                "fromCache": False,
-                "summary": "steady",
-                "sign": "云水签",
-                "omen": "中吉",
-                "luckScore": 80,
-            }
-
-        async with self.server.bind_fortune_turn("session-user", handler):
-            wrong_status, _ = await self.post_fortune(
-                token=self.server.token,
-                session_id="session-other",
-            )
-            good_status, body = await self.post_fortune(
-                token=self.server.token,
-                session_id="session-user",
-            )
-
-        self.assertEqual(wrong_status, 403)
-        self.assertEqual(good_status, 200)
-        self.assertEqual(body["luckScore"], 80)
-        self.assertEqual(calls, 1)
+    async def test_removed_fortune_route_and_binding_are_unavailable(self) -> None:
+        self.assertFalse(hasattr(self.server, 'bind_fortune_turn'))
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{self.server.endpoint}/v1/tools/daily-fortune",
+                headers={"Authorization": f"Bearer {self.server.token}"},
+                json={"sessionId": "session-user", "arguments": {}},
+            ) as response:
+                self.assertEqual(response.status, 404)
 
 
 if __name__ == "__main__":

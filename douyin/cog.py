@@ -14,12 +14,18 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
+from http.cookiejar import CookieJar, MozillaCookieJar
 
 import discord
 from discord import app_commands
 from discord.ext import commands
+
+from .public import (
+    DOUYIN_HOSTS, DouyinAccessError, DouyinWatermarkError, open_public_url,
+    parse_public_video, video_id_from_url, is_watermarked_url, unwatermarked_url,
+)
 
 try:
     import imageio_ffmpeg
@@ -60,7 +66,7 @@ class DownloadedDouyinVideo:
 
 
 StatusUpdater = Callable[[str], Awaitable[None]]
-VideoSender = Callable[[str, Path, str], Awaitable[None]]
+VideoSender = Callable[[DownloadedDouyinVideo, str], Awaitable[None]]
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -115,7 +121,12 @@ class DouyinVideoCog(commands.Cog):
         self.download_max_bytes = self._read_download_max_bytes()
         self.compress_if_needed = _env_flag('DOUYIN_COMPRESS_IF_NEEDED', True)
         self.parse_api_urls = self._read_parse_api_urls()
-        self.use_f2 = _env_flag('DOUYIN_USE_F2', True)
+        self.use_f2 = _env_flag('DOUYIN_USE_F2', False)
+        self.public_share_enabled = _env_flag('DOUYIN_PUBLIC_SHARE_ENABLED', True)
+        self.risk_cooldown_seconds = _env_int('DOUYIN_RISK_COOLDOWN_SECONDS', 120, minimum=0)
+        self.risk_blocked_until = 0.0
+        self._download_deadline = 0.0
+        self._cleanup_tasks: set[asyncio.Task] = set()
         self.parse_api_timeout_seconds = _env_int(
             'DOUYIN_PARSE_API_TIMEOUT_SECONDS',
             DEFAULT_PARSE_API_TIMEOUT_SECONDS,
@@ -128,7 +139,7 @@ class DouyinVideoCog(commands.Cog):
         self.download_lock = asyncio.Lock()
 
         if yt_dlp is None:
-            print('[WARN] Douyin resolver disabled: yt-dlp is not installed')
+            print('[WARN] Douyin yt-dlp fallback unavailable; public-share resolver is still enabled')
         if self.use_f2 and not self.f2_available:
             print('[WARN] Douyin f2 fallback disabled: f2 is not installed')
         if self.ffmpeg_executable is None:
@@ -144,13 +155,6 @@ class DouyinVideoCog(commands.Cog):
         interaction: discord.Interaction,
         url: str,
     ) -> None:
-        if yt_dlp is None:
-            await interaction.response.send_message(
-                '抖音视频解析功能缺少 yt-dlp 依赖，暂时不能使用。',
-                ephemeral=True,
-            )
-            return
-
         candidate = self._find_candidate(url)
         if candidate is None:
             await interaction.response.send_message(
@@ -172,11 +176,11 @@ class DouyinVideoCog(commands.Cog):
         async def update_status(content: str) -> None:
             await interaction.edit_original_response(content=content)
 
-        async def send_video(content: str, file_path: Path, filename: str) -> None:
-            file = discord.File(file_path, filename=filename)
+        async def send_video(video: DownloadedDouyinVideo, filename: str) -> None:
+            file = discord.File(video.file_path, filename=filename)
             try:
                 await interaction.followup.send(
-                    content=content,
+                    view=self._build_video_card(video, filename),
                     file=file,
                     allowed_mentions=discord.AllowedMentions.none(),
                     ephemeral=False,
@@ -198,7 +202,7 @@ class DouyinVideoCog(commands.Cog):
         except Exception as exc:
             print(
                 '[WARN] Failed to resolve Douyin video: '
-                f'user_id={interaction.user.id}, channel_id={interaction.channel_id}, error={exc}'
+                f'user_id={interaction.user.id}, channel_id={interaction.channel_id}, error={self._format_error(exc)}'
             )
             await interaction.edit_original_response(
                 content=f'解析抖音视频失败：{self._format_error(exc)}'
@@ -214,13 +218,6 @@ class DouyinVideoCog(commands.Cog):
         *,
         url: str,
     ) -> None:
-        if yt_dlp is None:
-            await ctx.reply(
-                '抖音视频解析功能缺少 yt-dlp 依赖，暂时不能使用。',
-                mention_author=False,
-            )
-            return
-
         candidate = self._find_candidate(url)
         if candidate is None:
             await ctx.reply('没有识别到抖音视频链接。', mention_author=False)
@@ -233,7 +230,7 @@ class DouyinVideoCog(commands.Cog):
         try:
             status_message = await ctx.author.send('正在解析抖音视频...')
         except discord.HTTPException:
-            status_message = None
+            status_message = await ctx.reply('正在解析抖音视频...', mention_author=False)
 
         async def update_status(content: str) -> None:
             if status_message is None:
@@ -243,11 +240,11 @@ class DouyinVideoCog(commands.Cog):
                 allowed_mentions=discord.AllowedMentions.none(),
             )
 
-        async def send_video(content: str, file_path: Path, filename: str) -> None:
-            file = discord.File(file_path, filename=filename)
+        async def send_video(video: DownloadedDouyinVideo, filename: str) -> None:
+            file = discord.File(video.file_path, filename=filename)
             try:
                 await ctx.channel.send(
-                    content=content,
+                    view=self._build_video_card(video, filename),
                     file=file,
                     allowed_mentions=discord.AllowedMentions.none(),
                 )
@@ -266,7 +263,7 @@ class DouyinVideoCog(commands.Cog):
         except Exception as exc:
             print(
                 '[WARN] Failed to resolve Douyin video: '
-                f'user_id={ctx.author.id}, channel_id={ctx.channel.id}, error={exc}'
+                f'user_id={ctx.author.id}, channel_id={ctx.channel.id}, error={self._format_error(exc)}'
             )
             await update_status(f'解析抖音视频失败：{self._format_error(exc)}')
 
@@ -293,45 +290,102 @@ class DouyinVideoCog(commands.Cog):
         send_video: VideoSender,
     ) -> None:
         upload_limit = self._upload_limit_for_guild(guild)
-        async with self.download_lock:
+        if time.monotonic() < self.risk_blocked_until:
+            remaining = max(1, round(self.risk_blocked_until - time.monotonic()))
+            raise DouyinAccessError(f'上次抖音公开访问被拒绝，暂停重复请求，还需等待约 {remaining} 秒。')
+        if self.download_lock.locked():
+            raise RuntimeError('已有抖音视频正在处理或清理，请等它结束后再发。')
+        await self.download_lock.acquire()
+        work_dir = None
+        handed_off = False
+        try:
             work_dir = Path(tempfile.mkdtemp(prefix='douyin_', dir=str(self._temp_root())))
+            worker = asyncio.create_task(asyncio.to_thread(
+                self._download_video, candidate, work_dir, upload_limit,
+            ))
             try:
-                video = await asyncio.wait_for(
-                    asyncio.to_thread(
-                        self._download_video,
-                        candidate,
-                        work_dir,
-                        upload_limit,
-                    ),
-                    timeout=self.download_timeout_seconds,
-                )
-                file_size = video.file_path.stat().st_size
-                if file_size > upload_limit:
-                    await update_status(
-                        f'视频太大啦：{_format_size(file_size)}，'
-                        f'当前频道最多只能上传 {_format_size(upload_limit)}。\n'
-                        f'原链接：{video.webpage_url}'
-                    )
-                    return
-
+                video = await asyncio.wait_for(asyncio.shield(worker), timeout=self.download_timeout_seconds)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                # Cancelling to_thread cannot stop its thread. Keep its lock and files
+                # alive until it exits, so cleanup/new downloads never race with it.
+                handed_off = True
+                task = asyncio.create_task(self._finish_abandoned_download(worker, work_dir))
+                self._cleanup_tasks.add(task)
+                task.add_done_callback(self._cleanup_tasks.discard)
+                raise
+            file_size = video.file_path.stat().st_size
+            if file_size > upload_limit:
                 await update_status(
-                    f'解析完成，正在上传：{video.title} ({_format_size(file_size)})'
+                    f'视频太大啦：{_format_size(file_size)}，'
+                    f'当前频道最多只能上传 {_format_size(upload_limit)}。\n'
+                    f'原链接：{video.webpage_url}'
                 )
-                await send_video(
-                    f'抖音视频：{video.title}\n{video.webpage_url}',
-                    video.file_path,
-                    f'{_safe_filename(video.title)}.mp4',
-                )
-                await update_status(f'已发送：{video.title}')
+                return
+            await update_status(f'解析完成，正在上传：{video.title} ({_format_size(file_size)})')
+            # Keep a machine-safe attachment name so Markdown/media references agree.
+            await send_video(video, 'douyin-video' + video.file_path.suffix.lower())
+            await update_status(f'已发送：{video.title}')
+        except DouyinAccessError:
+            self.risk_blocked_until = time.monotonic() + self.risk_cooldown_seconds
+            raise
+        finally:
+            if not handed_off:
+                try:
+                    if work_dir is not None:
+                        await asyncio.to_thread(self._remove_tree_with_retries, work_dir)
+                finally:
+                    self.download_lock.release()
 
-            finally:
+    async def _finish_abandoned_download(self, worker: asyncio.Task, work_dir: Path) -> None:
+        try:
+            await worker
+        except DouyinAccessError:
+            self.risk_blocked_until = time.monotonic() + self.risk_cooldown_seconds
+        except Exception as exc:
+            print(f'[INFO] Douyin background download ended: {type(exc).__name__}')
+        finally:
+            try:
                 await asyncio.to_thread(self._remove_tree_with_retries, work_dir)
+            except Exception as exc:
+                print(f'[WARN] Douyin temporary cleanup failed: {type(exc).__name__}')
+            finally:
+                self.download_lock.release()
+
+    def _build_video_card(
+        self, video: DownloadedDouyinVideo, filename: str,
+    ) -> discord.ui.LayoutView:
+        title = ' '.join(video.title.split()) or '抖音视频'
+        title = discord.utils.escape_mentions(discord.utils.escape_markdown(title[:180]))
+        details = []
+        if video.duration_seconds is not None and video.duration_seconds > 0:
+            hours, remainder = divmod(round(video.duration_seconds), 3600)
+            minutes, seconds = divmod(remainder, 60)
+            duration = f'{hours}:{minutes:02d}:{seconds:02d}' if hours else f'{minutes:02d}:{seconds:02d}'
+            details.append(f'⏱ {duration}')
+        details.append(f'📦 {_format_size(video.file_path.stat().st_size)}')
+        container = discord.ui.Container(
+            discord.ui.TextDisplay('-# DOUYIN · 抖音视频'),
+            discord.ui.TextDisplay(f'### {title}'),
+            discord.ui.MediaGallery(discord.MediaGalleryItem(
+                f'attachment://{filename}', description=video.title[:256],
+            )),
+            discord.ui.Separator(spacing=discord.SeparatorSpacing.small),
+            discord.ui.TextDisplay('-# ' + '　·　'.join(details)),
+            discord.ui.ActionRow(discord.ui.Button(
+                label='在抖音打开', style=discord.ButtonStyle.link,
+                emoji='↗️', url=video.webpage_url,
+            )),
+            accent_colour=0x25F4EE,
+        )
+        view = discord.ui.LayoutView(timeout=None)
+        view.add_item(container)
+        return view
 
     def _find_candidate(self, text: str) -> DouyinCandidate | None:
         match = DOUYIN_URL_PATTERN.search(text)
         if match is None:
             return None
-        return DouyinCandidate(source_url=self._normalize_douyin_url(match.group(0)))
+        return DouyinCandidate(source_url=self._normalize_douyin_url(match.group(0).rstrip('，。；！!、』」】')))
 
     def _normalize_douyin_url(self, raw_url: str) -> str:
         parsed = urllib.parse.urlparse(raw_url)
@@ -347,40 +401,115 @@ class DouyinVideoCog(commands.Cog):
         work_dir: Path,
         upload_limit: int,
     ) -> DownloadedDouyinVideo:
+        self._download_deadline = time.monotonic() + self.download_timeout_seconds
+        routes = []
+        if self.public_share_enabled:
+            routes.append(('public-share', lambda: self._download_public_video(candidate, work_dir, upload_limit)))
+            if self.cookie_file is not None and self.cookie_file.is_file():
+                routes.append(('cookie-share', lambda: self._download_cookie_video(candidate, work_dir, upload_limit)))
+        if yt_dlp is not None:
+            routes.append(('yt-dlp', lambda: self._download_video_at_height(candidate, work_dir, self.max_height)))
+        if self.use_f2 and self.f2_available and self.cookie_file is not None:
+            routes.append(('f2', lambda: self._download_video_with_f2(candidate, work_dir)))
         if self.parse_api_urls:
-            try:
-                video = self._download_video_with_parse_api(candidate, work_dir, upload_limit)
-                return self._ensure_uploadable(video, work_dir, upload_limit)
-            except Exception as exc:
-                print(f'[WARN] Douyin parse API failed, falling back to yt-dlp: {exc}')
-
-        if self.use_f2 and self.f2_available:
-            try:
-                video = self._download_video_with_f2(candidate, work_dir)
-                return self._ensure_uploadable(video, work_dir, upload_limit)
-            except Exception as exc:
-                print(f'[WARN] Douyin f2 fallback failed, falling back to yt-dlp: {exc}')
-
-        last_error: Exception | None = None
-        heights = self._candidate_heights()
-        for height in heights:
+            routes.append(('configured-api', lambda: self._download_video_with_parse_api(candidate, work_dir, upload_limit)))
+        last_error = None
+        access_failed = False
+        access_detail = ''
+        for label, run in routes:
+            self._remaining_timeout()
             self._clear_work_dir(work_dir)
             try:
-                video = self._download_video_at_height(candidate, work_dir, height)
+                video = run()
+                video = self._ensure_uploadable(video, work_dir, upload_limit)
+                print(f'[INFO] Douyin resolved: route={label}, bytes={video.file_path.stat().st_size}')
+                return video
+            except TimeoutError:
+                raise
             except Exception as exc:
                 last_error = exc
-                continue
-
-            if video.file_path.stat().st_size <= upload_limit:
-                return video
-
-            fitted = self._ensure_uploadable(video, work_dir, upload_limit)
-            if fitted.file_path.stat().st_size <= upload_limit or height == heights[-1]:
-                return fitted
-
+                access_failed = access_failed or self._is_access_error(exc)
+                if self._is_access_error(exc):
+                    access_detail = self._format_error(exc)
+                print(f'[WARN] Douyin {label} failed: {self._format_error(exc)}')
         if last_error is not None:
+            if access_failed:
+                raise DouyinAccessError(
+                    '原站没有提供可用视频，已配置的备用解析也未成功。'
+                    f'访问错误：{access_detail} '
+                    '请确认原链接在浏览器可播放，再检查凭证与服务器访问情况；'
+                    '单纯重启 BOT 或反复重试不能解除原站访问限制。'
+                ) from None
             raise last_error
-        raise RuntimeError('没有找到可下载的视频格式。')
+        raise RuntimeError('没有启用可用的抖音解析方式。')
+
+    def _remaining_timeout(self, maximum: float = 30) -> float:
+        deadline = getattr(self, '_download_deadline', 0.0)
+        if not deadline:
+            return maximum
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError('抖音视频处理超时。')
+        return min(maximum, remaining)
+
+    def _download_public_video(
+        self, candidate: DouyinCandidate, work_dir: Path, upload_limit: int,
+    ) -> DownloadedDouyinVideo:
+        return self._download_share_video(candidate, work_dir, upload_limit)
+
+    def _download_cookie_video(
+        self, candidate: DouyinCandidate, work_dir: Path, upload_limit: int,
+    ) -> DownloadedDouyinVideo:
+        try:
+            source = MozillaCookieJar(str(self.cookie_file))
+            source.load(ignore_discard=True, ignore_expires=False)
+        except (OSError, ValueError):
+            raise RuntimeError('抖音 Cookie 文件无法读取或格式无效，请通过凭证管理更新。') from None
+        jar = CookieJar()
+        for cookie in source:
+            if cookie.domain.lstrip('.').lower() in DOUYIN_HOSTS:
+                jar.set_cookie(cookie)
+        if not len(jar):
+            raise RuntimeError('抖音 Cookie 文件没有未过期的相关凭证，请通过凭证管理更新。')
+        return self._download_share_video(candidate, work_dir, upload_limit, cookie_jar=jar)
+
+    def _download_share_video(
+        self, candidate: DouyinCandidate, work_dir: Path, upload_limit: int,
+        *, cookie_jar: CookieJar | None = None,
+    ) -> DownloadedDouyinVideo:
+        options = {'allowed_hosts': DOUYIN_HOSTS}
+        if cookie_jar is not None:
+            options['cookie_jar'] = cookie_jar
+        video_id = video_id_from_url(candidate.source_url)
+        if video_id is None:
+            with open_public_url(candidate.source_url, timeout=self._remaining_timeout(20),
+                                 **options) as response:
+                video_id = video_id_from_url(response.geturl())
+            if video_id is None:
+                raise RuntimeError('该分享链接不是可识别的单条视频，暂不支持图集、直播或合集。')
+        # The legacy iesdouyin host often returns a valid HTML shell without
+        # videoInfoRes. Use the current official share host, which also matches
+        # the domain of the user's exported Douyin cookies.
+        url = f'https://www.douyin.com/share/video/{video_id}/'
+        with open_public_url(url, timeout=self._remaining_timeout(20),
+                             **options) as response:
+            chunks, size = [], 0
+            while True:
+                self._remaining_timeout()
+                chunk = response.read1(64 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > 4 * 1024 * 1024:
+                    raise RuntimeError('抖音分享页超出解析大小限制。')
+                chunks.append(chunk)
+        info = parse_public_video(b''.join(chunks).decode('utf-8', 'replace'), video_id)
+        path = work_dir / 'douyin-public.mp4'
+        self._download_direct_video(info.video_url, path, upload_limit)
+        return DownloadedDouyinVideo(
+            title=info.title, webpage_url=f'https://www.douyin.com/video/{video_id}',
+            file_path=path, duration_seconds=info.duration_seconds,
+        )
 
     def _ensure_uploadable(
         self,
@@ -388,6 +517,10 @@ class DouyinVideoCog(commands.Cog):
         work_dir: Path,
         upload_limit: int,
     ) -> DownloadedDouyinVideo:
+        if video.file_path.stat().st_size > self.download_max_bytes:
+            raise RuntimeError(f'视频超过下载限制：{_format_size(self.download_max_bytes)}')
+        if video.duration_seconds is None:
+            video = replace(video, duration_seconds=self._probe_duration_seconds(video.file_path))
         if video.file_path.stat().st_size <= upload_limit:
             return video
         compressed = self._compress_video_if_needed(video, work_dir, upload_limit)
@@ -400,15 +533,16 @@ class DouyinVideoCog(commands.Cog):
         upload_limit: int,
     ) -> DownloadedDouyinVideo:
         last_error: Exception | None = None
-        for index, parse_api_url in enumerate(self.parse_api_urls, start=1):
+        for index, parse_api_url in enumerate(self.parse_api_urls[:3], start=1):
             try:
+                self._remaining_timeout()
                 api_response = self._request_parse_api(parse_api_url, candidate.source_url)
                 video_url = self._extract_video_url(api_response)
                 if not video_url:
                     raise RuntimeError('第三方解析接口没有返回可用的视频直链。')
 
                 title = self._extract_title(api_response) or 'Douyin video'
-                webpage_url = self._extract_webpage_url(api_response) or candidate.source_url
+                webpage_url = candidate.source_url
                 output_path = work_dir / f'douyin-api-{index}.mp4'
                 self._download_direct_video(video_url, output_path, upload_limit)
 
@@ -419,8 +553,10 @@ class DouyinVideoCog(commands.Cog):
                     duration_seconds=None,
                 )
             except Exception as exc:
+                if isinstance(exc, TimeoutError):
+                    raise
                 last_error = exc
-                print(f'[WARN] Douyin parse API #{index} failed: {exc}')
+                print(f'[WARN] Douyin parse API #{index} failed: {self._format_error(exc)}')
 
         if last_error is not None:
             raise last_error
@@ -433,12 +569,9 @@ class DouyinVideoCog(commands.Cog):
     ) -> DownloadedDouyinVideo:
         cookie_header = self._read_cookie_header()
         if not cookie_header:
-            raise RuntimeError('f2 需要登录后的抖音 cookie。')
+            raise RuntimeError('f2 备用解析需要配置可用的抖音 Cookie。')
 
-        command = [
-            sys.executable,
-            '-m',
-            'f2',
+        arguments = [
             'dy',
             '-M',
             'one',
@@ -457,7 +590,7 @@ class DouyinVideoCog(commands.Cog):
             '-o',
             '1',
             '-e',
-            str(max(self.download_timeout_seconds, 30)),
+            str(max(1, int(self._remaining_timeout(20)))),
             '-r',
             '1',
             '-k',
@@ -466,21 +599,30 @@ class DouyinVideoCog(commands.Cog):
         env = os.environ.copy()
         env['PYTHONIOENCODING'] = 'utf-8'
         env['PYTHONUTF8'] = '1'
-        result = subprocess.run(
-            command,
-            cwd=str(Path(__file__).resolve().parents[1]),
-            env=env,
-            text=True,
-            encoding='utf-8',
-            errors='replace',
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=self.download_timeout_seconds,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(self._compact_process_output(result.stdout))
-
+        # F2 can exit 0 after an HTTP failure. Inspect only a bounded private
+        # capture for status codes; never forward its cookies/configuration.
+        # Its logs and SQLite files also belong to this job, not the project.
+        with tempfile.TemporaryFile() as capture:
+            result = subprocess.run(
+                [sys.executable, '-c',
+                 'import json, sys; from f2.cli.cli_commands import main; main(args=json.load(sys.stdin))'],
+                input=json.dumps(arguments), cwd=str(work_dir), env=env,
+                text=True, encoding='utf-8', errors='replace',
+                stdout=capture, stderr=subprocess.STDOUT,
+                timeout=self._remaining_timeout(60),
+            )
+            capture.seek(0)
+            diagnostic = capture.read(64 * 1024).decode('utf-8', 'replace')
+        diagnostic = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', diagnostic)
+        denied = re.search(r'HTTP/\S+[^\d\r\n]{1,8}(401|403|412|429)\b', diagnostic)
         video_path = self._find_downloaded_video_file_recursive(work_dir)
+        if video_path is None and denied:
+            raise DouyinAccessError(
+                f'F2 访问抖音接口被拒绝（HTTP {denied.group(1)}），没有下载到视频。'
+            )
+        if result.returncode != 0:
+            raise RuntimeError(f'F2 备用解析失败（退出码 {result.returncode}），不循环重试。')
+
         if video_path is None:
             raise RuntimeError('f2 运行完成后没有找到视频文件。')
 
@@ -494,26 +636,14 @@ class DouyinVideoCog(commands.Cog):
     def _read_cookie_header(self) -> str:
         if self.cookie_file is None or not self.cookie_file.is_file():
             return ''
-        pairs: list[str] = []
         try:
-            lines = self.cookie_file.read_text(
-                encoding='utf-8-sig',
-                errors='replace',
-            ).splitlines()
-        except OSError:
+            jar = MozillaCookieJar(str(self.cookie_file))
+            jar.load(ignore_discard=True, ignore_expires=False)
+            request = urllib.request.Request('https://www.douyin.com/')
+            jar.add_cookie_header(request)
+            return request.get_header('Cookie') or ''
+        except (OSError, ValueError):
             return ''
-
-        for line in lines:
-            line = line.strip()
-            if line.startswith('#HttpOnly_'):
-                line = line[len('#HttpOnly_'):]
-            elif not line or line.startswith('#'):
-                continue
-            parts = line.split('\t')
-            if len(parts) < 7 or 'douyin.com' not in parts[0]:
-                continue
-            pairs.append(f'{parts[5]}={parts[6]}')
-        return '; '.join(pairs)
 
     def _compact_process_output(self, output: str, limit: int = 800) -> str:
         compact = ' '.join(output.split())
@@ -521,7 +651,8 @@ class DouyinVideoCog(commands.Cog):
             return 'f2 执行失败。'
         if len(compact) > limit:
             compact = compact[-limit:]
-        return compact
+        return self._safe_error_text(compact)
+
     def _request_parse_api(self, parse_api_url: str, source_url: str) -> object:
         encoded_url = urllib.parse.quote(source_url, safe='')
         api_url = parse_api_url
@@ -544,9 +675,11 @@ class DouyinVideoCog(commands.Cog):
         )
         with urllib.request.urlopen(
             request,
-            timeout=self.parse_api_timeout_seconds,
+            timeout=self._remaining_timeout(self.parse_api_timeout_seconds),
         ) as response:
-            body = response.read(2 * 1024 * 1024)
+            body = response.read(2 * 1024 * 1024 + 1)
+            if len(body) > 2 * 1024 * 1024:
+                raise RuntimeError('第三方解析响应过大。')
 
         text = body.decode('utf-8-sig', errors='replace').strip()
         if text.startswith(('callback(', 'jsonp(')) and text.endswith(')'):
@@ -559,66 +692,65 @@ class DouyinVideoCog(commands.Cog):
         output_path: Path,
         upload_limit: int,
     ) -> None:
-        request = urllib.request.Request(
-            video_url,
-            headers={
-                'Accept': '*/*',
-                'Referer': 'https://www.douyin.com/',
-                'User-Agent': (
-                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                    'AppleWebKit/537.36 (KHTML, like Gecko) '
-                    'Chrome/124.0.0.0 Safari/537.36'
-                ),
-            },
-        )
-        byte_limit = min(self.download_max_bytes, max(upload_limit * 3, upload_limit))
         total = 0
         try:
-            with urllib.request.urlopen(request, timeout=60) as response:
+            video_url = unwatermarked_url(video_url)
+            with open_public_url(video_url, timeout=self._remaining_timeout(20)) as response:
+                if is_watermarked_url(response.geturl()):
+                    raise DouyinWatermarkError('播放地址又跳转到了水印版本，已停止下载。')
+                content_type = response.headers.get('Content-Type', '').split(';')[0].lower()
+                if content_type and not (content_type.startswith('video/') or content_type in {
+                    'application/octet-stream', 'binary/octet-stream', 'application/mp4',
+                }):
+                    raise RuntimeError('直链返回的不是视频文件（可能是验证页或图片）。')
                 content_length = response.headers.get('Content-Length')
-                if content_length and int(content_length) > self.download_max_bytes:
-                    raise RuntimeError(
-                        f'解析出的直链文件过大：{_format_size(int(content_length))}'
-                    )
-
+                expected = int(content_length) if content_length and content_length.isdecimal() else None
+                if expected is not None and expected > self.download_max_bytes:
+                    raise RuntimeError(f'视频超过下载限制：{_format_size(self.download_max_bytes)}')
                 with output_path.open('wb') as file_obj:
                     while True:
-                        chunk = response.read(1024 * 256)
+                        self._remaining_timeout()
+                        chunk = response.read1(256 * 1024)
                         if not chunk:
                             break
                         total += len(chunk)
-                        if total > byte_limit:
-                            raise RuntimeError(
-                                f'解析出的直链超过下载限制：{_format_size(byte_limit)}'
-                            )
+                        if total > self.download_max_bytes:
+                            raise RuntimeError(f'视频超过下载限制：{_format_size(self.download_max_bytes)}')
+                        if not file_obj.tell() and (chunk.lstrip().startswith((b'<', b'{', b'['))):
+                            raise RuntimeError('直链返回的是网页或错误数据，不是视频。')
                         file_obj.write(chunk)
-        except urllib.error.URLError as exc:
-            raise RuntimeError(f'下载第三方解析直链失败：{exc}') from exc
-
-        if not output_path.is_file() or output_path.stat().st_size <= 1024:
-            raise RuntimeError('第三方解析直链下载后文件为空。')
+                if expected is not None and total != expected:
+                    raise RuntimeError('视频下载不完整，请稍后重试。')
+                if total <= 1024:
+                    raise RuntimeError('视频文件为空或过小。')
+        except BaseException:
+            output_path.unlink(missing_ok=True)
+            raise
 
     def _extract_video_url(self, data: object) -> str | None:
-        preferred_names = {
-            'video_url',
-            'play_url',
-            'no_watermark',
-            'nwm_video_url',
-            'download_url',
-            'wmplay',
-            'nwmplay',
-        }
-        fallback_urls: list[str] = []
-        for key, value in self._walk_json_values(data):
-            if not isinstance(value, str) or not value.startswith(('http://', 'https://')):
-                continue
-            if not self._looks_like_video_url(value):
-                continue
-            key_name = str(key).lower()
-            if key_name in preferred_names:
-                return value
-            fallback_urls.append(value)
-        return fallback_urls[0] if fallback_urls else None
+        clean_names = {'no_watermark', 'nwm_video_url', 'nwmplay', 'nowm', 'nowatermark', 'play_no_watermark'}
+        watermarked_names = {'wmplay', 'playwm', 'wm_url', 'watermark_url', 'watermarked_url', 'watermark'}
+        preferred_names = {'video_url', 'play_url', 'download_url'}
+        candidates = []
+
+        def visit(value, priority=2):
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    key = str(key).lower()
+                    if key not in watermarked_names:
+                        rank = 0 if key in clean_names else 1 if key in preferred_names else 2
+                        visit(child, min(priority, rank))
+            elif isinstance(value, list):
+                for child in value:
+                    visit(child, priority)
+            elif isinstance(value, str) and value.startswith(('http://', 'https://')) and self._looks_like_video_url(value):
+                try:
+                    candidates.append((priority, unwatermarked_url(value)))
+                except DouyinWatermarkError:
+                    pass
+
+        visit(data)
+        return min(candidates, key=lambda item: item[0])[1] if candidates else None
 
     def _extract_title(self, data: object) -> str | None:
         for key, value in self._walk_json_values(data):
@@ -649,13 +781,14 @@ class DouyinVideoCog(commands.Cog):
         parsed = urllib.parse.urlparse(url)
         host = parsed.netloc.lower()
         path = parsed.path.lower()
+        if path.endswith(('.jpg', '.jpeg', '.png', '.webp', '.gif', '.avif')):
+            return False
         if path.endswith(('.mp4', '.mov', '.m4v')):
             return True
         return any(
             marker in host
             for marker in (
                 'douyinvod',
-                'byteimg',
                 'ixigua',
                 'amemv',
                 'snssdk',
@@ -678,9 +811,11 @@ class DouyinVideoCog(commands.Cog):
             'noplaylist': True,
             'noprogress': True,
             'overwrites': True,
-            'retries': 3,
-            'fragment_retries': 3,
-            'socket_timeout': 20,
+            'retries': 0,
+            'fragment_retries': 0,
+            'extractor_retries': 0,
+            'socket_timeout': self._remaining_timeout(20),
+            'progress_hooks': [lambda _status: self._remaining_timeout()],
             'max_filesize': self.download_max_bytes,
             'http_headers': {
                 'Referer': 'https://www.douyin.com/',
@@ -694,7 +829,21 @@ class DouyinVideoCog(commands.Cog):
         if self.ffmpeg_executable:
             ydl_opts['ffmpeg_location'] = self.ffmpeg_executable
         if self.cookie_file is not None:
-            ydl_opts['cookiefile'] = str(self.cookie_file)
+            # yt-dlp saves its cookie jar on exit (even on failure). Give it a
+            # per-job copy, not the credential manager's persistent browser export.
+            cookie_copy = work_dir / 'cookies.txt'
+            try:
+                source = MozillaCookieJar(str(self.cookie_file))
+                source.load(ignore_discard=True, ignore_expires=False)
+                filtered = MozillaCookieJar(str(cookie_copy))
+                for cookie in source:
+                    if cookie.domain.lstrip('.').lower() in DOUYIN_HOSTS:
+                        filtered.set_cookie(cookie)
+                filtered.save(ignore_discard=True, ignore_expires=False)
+                cookie_copy.chmod(0o600)
+            except (OSError, ValueError):
+                raise RuntimeError('抖音 Cookie 文件无法读取或格式无效，请通过凭证管理更新 Netscape 格式 Cookie。') from None
+            ydl_opts['cookiefile'] = str(cookie_copy)
         elif self.cookies_from_browser is not None:
             ydl_opts['cookiesfrombrowser'] = (self.cookies_from_browser,)
 
@@ -707,29 +856,25 @@ class DouyinVideoCog(commands.Cog):
 
         return DownloadedDouyinVideo(
             title=str(info.get('title') or info.get('id') or 'Douyin video'),
-            webpage_url=str(info.get('webpage_url') or candidate.source_url),
+            webpage_url=candidate.source_url,
             file_path=video_path,
             duration_seconds=self._read_duration(info),
         )
 
     def _format_selector(self, height: int) -> str:
+        # Do not accept yt-dlp's lower-priority watermarked download_addr when
+        # ordinary playback formats are unavailable. '?' permits absent notes.
+        clean = '[format_note!*=?watermarked][url!*=?playwm]'
+        video, audio, best = f'bestvideo{clean}', f'bestaudio{clean}', f'best{clean}'
         return (
-            f'bestvideo[height<={height}]+bestaudio/'
-            f'bestvideo[width<={height}]+bestaudio/'
-            f'best[ext=mp4][height<={height}]/'
-            f'best[ext=mp4][width<={height}]/'
-            f'best[height<={height}]/'
-            f'best[width<={height}]/'
-            'best'
+            f'{video}[height<={height}]+{audio}/'
+            f'{video}[width<={height}]+{audio}/'
+            f'{best}[ext=mp4][height<={height}]/'
+            f'{best}[ext=mp4][width<={height}]/'
+            f'{best}[height<={height}]/'
+            f'{best}[width<={height}]/'
+            f'{best}'
         )
-
-    def _candidate_heights(self) -> list[int]:
-        heights = [self.max_height, 1080, 720, 480, 360]
-        unique: list[int] = []
-        for height in heights:
-            if height not in unique and height <= self.max_height:
-                unique.append(height)
-        return unique or [720, 480, 360]
 
     def _upload_limit_for_guild(self, guild: discord.Guild | None) -> int:
         if self.max_upload_bytes_override is not None:
@@ -806,16 +951,12 @@ class DouyinVideoCog(commands.Cog):
 
     def _default_cookie_file_candidates(self) -> list[Path]:
         project_root = Path(__file__).resolve().parents[1]
-        home = Path.home()
         return [
             project_root / 'config' / 'credentials' / 'douyin_cookies.txt',
             project_root / 'douyin' / 'cookies.txt',
             project_root / 'douyin' / 'www.douyin.com_cookies.txt',
             project_root / 'cookies.txt',
             project_root / 'www.douyin.com_cookies.txt',
-            home / 'Downloads' / 'cookies.txt',
-            home / 'Desktop' / 'www.douyin.com_cookies.txt',
-            home / 'Downloads' / 'www.douyin.com_cookies.txt',
         ]
 
     def _read_cookies_from_browser(self) -> str | None:
@@ -828,61 +969,35 @@ class DouyinVideoCog(commands.Cog):
             return None
         return raw
 
-    def _format_error(self, exc: Exception) -> str:
-        text = str(exc)
-        lowered = text.lower()
-        if 'could not copy chrome cookie database' in lowered or (
-            'permission denied' in lowered and 'cookies' in lowered
-        ):
-            return (
-                '浏览器 cookie 数据库正在被占用，yt-dlp 读不到。'
-                '请先完全关闭 Chrome/Edge 后重启 bot；如果仍失败，'
-                '改用 DOUYIN_COOKIE_FILE=config/credentials/douyin_cookies.txt。'
-            )
-        if 'fresh cookies' in lowered or ('cookies' in lowered and 'needed' in lowered):
-            cookie_hint = self._cookie_file_diagnostic_hint()
-            if cookie_hint:
-                return cookie_hint
-            return (
-                '抖音要求 fresh cookies。请把导出的 cookies.txt '
-                '放到 config/credentials/ 目录；也可以在 .env 设置 '
-                'DOUYIN_COOKIES_FROM_BROWSER=edge/chrome/firefox。'
-            )
-        return text
-
-    def _cookie_file_diagnostic_hint(self) -> str | None:
-        if self.cookie_file is None or not self.cookie_file.is_file():
-            return None
-        try:
-            text = self.cookie_file.read_text(encoding='utf-8-sig', errors='replace')
-        except OSError:
-            return None
-
-        cookie_names: set[str] = set()
-        for line in text.splitlines():
-            if not line.strip() or line.startswith('#'):
-                continue
-            parts = line.split('\t')
-            if len(parts) >= 7:
-                cookie_names.add(parts[5])
-
-        if 's_v_web_id' not in cookie_names:
-            return (
-                '这份抖音 cookie 文件缺少 s_v_web_id，yt-dlp 会判定不是 fresh cookies。'
-                '请在浏览器打开 https://www.douyin.com/ 或那条视频链接，等页面正常播放后，'
-                '用 Get cookies.txt LOCALLY 重新导出完整 cookies，覆盖 '
-                'config/credentials/douyin_cookies.txt。'
-            )
-        if 'sessionid' not in cookie_names:
-            return (
-                '这份抖音 cookie 文件不像是登录后的 cookie。'
-                '请先在浏览器登录网页版抖音，打开视频页确认能播放，再重新导出 cookies。'
-            )
-        return (
-            'cookie 文件已读到，但抖音接口仍然拒绝了这份 cookie。'
-            '这不是缺某一条固定 cookie，而是当前 yt-dlp 的抖音解析器被抖音风控/签名校验挡住了。'
-            '换 cookies.txt 或 Firefox 直读也可能一样失败，只能等 yt-dlp 修复或换解析方案。'
+    @staticmethod
+    def _safe_error_text(text: str) -> str:
+        text = re.sub(r'https?://[^\s\'"<>]+', '[链接已隐藏]', text)
+        text = re.sub(
+            r'(?i)\b([\w]*(?:token|cookie|sessionid|sid_tt|sid_guard|ttwid|api_key)[\w]*)\s*=\s*[^;\s\'"]+',
+            r'\1=[已隐藏]', text,
         )
+        return discord.utils.escape_mentions(' '.join(text.split())[:500])
+
+    @staticmethod
+    def _is_access_error(exc: Exception) -> bool:
+        text = str(exc).lower()
+        return isinstance(exc, DouyinAccessError) or any(
+            marker in text for marker in ('fresh cookies', 'cookies are needed', 'http error 403',
+                                          'http error 412', 'http error 429', 'captcha', '验证码')
+        )
+
+    def _format_error(self, exc: Exception) -> str:
+        if isinstance(exc, subprocess.TimeoutExpired):
+            return '抖音备用下载或压缩进程超时。'
+        if isinstance(exc, TimeoutError):
+            return '抖音视频处理超时，正在清理后台任务。'
+        if 'fresh cookies' in str(exc).lower():
+            return (
+                'yt-dlp 没有从抖音详情接口拿到有效视频数据。'
+                '该通用错误不能证明 Cookie 已过期，也可能是接口限制或作品不可用；'
+                '若需更新凭证请使用凭证管理，不要反复请求同一接口。'
+            )
+        return self._safe_error_text(str(exc)) or type(exc).__name__
 
     def _resolve_ffmpeg_executable(self) -> str | None:
         ffmpeg_executable = shutil.which('ffmpeg')
@@ -958,7 +1073,7 @@ class DouyinVideoCog(commands.Cog):
                 text=True,
                 encoding='utf-8',
                 errors='replace',
-                timeout=30,
+                timeout=self._remaining_timeout(30),
             )
         except Exception:
             return None
@@ -1023,10 +1138,10 @@ class DouyinVideoCog(commands.Cog):
                 check=True,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                timeout=max(60, min(int(video.duration_seconds * 3), 600)),
+                timeout=self._remaining_timeout(max(60, min(int(video.duration_seconds * 3), 600))),
             )
         except Exception as exc:
-            print(f'[WARN] Failed to compress Douyin video: {exc}')
+            print(f'[WARN] Failed to compress Douyin video: {self._format_error(exc)}')
             return None
 
         if not output_path.is_file() or output_path.stat().st_size <= 1024:

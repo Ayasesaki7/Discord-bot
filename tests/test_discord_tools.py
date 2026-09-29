@@ -324,6 +324,8 @@ class DiscordToolHostTests(unittest.IsolatedAsyncioTestCase):
         )
         host.message.guild.members = [member]
         host.message.guild.roles = [role]
+        host.message.guild.get_member = lambda value: member if value == member.id else None
+        host.message.guild.get_role = lambda value: role if value == role.id else None
         host._require_editable_role = lambda _role: None
 
         result = await host.execute(
@@ -388,6 +390,26 @@ class DiscordToolHostTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(payload), 1)
         self.assertEqual(payload[0]["authorId"], str(target.id))
         self.assertEqual(payload[0]["content"], "target message")
+
+    async def test_recent_messages_preserves_forwarded_snapshot_and_forwarder(self) -> None:
+        from datetime import datetime, timezone
+        host = self.make_host(owner=True)
+        forwarded = SimpleNamespace(
+            id=901, author=SimpleNamespace(id=21, display_name='forwarder'), content='',
+            created_at=datetime(2026, 9, 9, tzinfo=timezone.utc), attachments=[],
+            reference=SimpleNamespace(type=discord.MessageReferenceType.forward, message_id=777, channel_id=888, guild_id=999),
+            message_snapshots=[SimpleNamespace(content='转发的正文', created_at=None,
+                attachments=[], embeds=[], stickers=[], components=[])],
+        )
+        async def history(**kwargs):
+            yield forwarded
+        host.message.channel.history = history
+        result = await host.execute('recent_messages', {'limit': 1})
+        payload = json.loads(result['content'])
+        self.assertEqual(payload[0]['authorId'], '21')
+        self.assertEqual(payload[0]['id'], '901')
+        self.assertIn('转发的正文', payload[0]['forwardedContext'])
+        self.assertIn('原作者身份未由 Discord 快照提供', payload[0]['forwardedContext'])
 
     async def test_duplicate_display_name_is_rejected_instead_of_guessing(self) -> None:
         host = self.make_host(owner=True)

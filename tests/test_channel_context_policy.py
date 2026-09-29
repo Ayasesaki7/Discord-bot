@@ -8,7 +8,6 @@ from pathlib import Path
 from chat.agent.context_policy import (
     ChannelContextPolicy,
     ChannelContextPolicyStore,
-    PASSIVE_HISTORY_BATCH_VERSION,
 )
 
 
@@ -59,56 +58,11 @@ class ChannelContextPolicyStoreTests(unittest.TestCase):
                 300,
             )
             self.assertEqual(store.get(100, 200).imported_through_message_id, 999)
-            self.assertEqual(store.get(100, 200).observed_through_message_id, 999)
-            self.assertTrue(store.get(100, 200).passive_history_initialized)
-            self.assertEqual(
-                store.get(100, 200).passive_history_version,
-                PASSIVE_HISTORY_BATCH_VERSION,
-            )
-
-            store.record_observed(100, 200, through_message_id=1_200)
-            store.record_observed(100, 200, through_message_id=1_100)
-            reloaded = ChannelContextPolicyStore(root)
-            self.assertEqual(
-                reloaded.get(100, 200).observed_through_message_id,
-                1_200,
-            )
 
             store.clear_runtime_usage(100, 200)
             cleared = store.get(100, 200)
             self.assertEqual(cleared.imported_message_count, 0)
             self.assertIsNone(cleared.imported_through_message_id)
-            self.assertIsNone(cleared.observed_through_message_id)
-            self.assertFalse(cleared.passive_history_initialized)
-            self.assertEqual(cleared.passive_history_version, 0)
-
-    def test_legacy_live_injection_watermark_requires_one_batch_rescan(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            path = root / 'chat' / 'agent' / 'data' / 'channel_contexts.json'
-            path.parent.mkdir(parents=True)
-            path.write_text(
-                json.dumps(
-                    {
-                        'version': 1,
-                        'channels': {
-                            '100:200': {
-                                'history_messages': 300,
-                                'token_budget': 80_000,
-                                'overflow_strategy': 'compress',
-                                'observed_through_message_id': 999,
-                                'passive_history_initialized': True,
-                            }
-                        },
-                    }
-                ),
-                encoding='utf-8',
-            )
-
-            state = ChannelContextPolicyStore(root).get(100, 200)
-
-            self.assertTrue(state.passive_history_initialized)
-            self.assertEqual(state.passive_history_version, 0)
 
     def test_policy_rejects_unsafe_sizes(self) -> None:
         with self.assertRaises(ValueError):

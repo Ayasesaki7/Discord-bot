@@ -5,6 +5,7 @@ import io
 import ipaddress
 import json
 import re
+import secrets
 import socket
 from collections.abc import Awaitable, Callable
 from datetime import timedelta
@@ -17,6 +18,7 @@ import discord
 from yarl import URL
 
 from ..tls import build_verified_ssl_context
+from ..forwarded import forwarded_context
 from tools.cleanup import GeneratedArtifactCleaner, collect_cleanup_protection
 
 
@@ -223,6 +225,22 @@ class DiscordToolHost:
         # operation for this turn only. A changed target/scope gets a new key
         # and therefore requires another reaction.
         self._confirmed_destructive_scopes: set[str] = set()
+        # Opaque, typed references belong to this request, never channel memory.
+        self._reference_nonce = secrets.token_hex(4)
+        self._target_refs: dict[str, tuple[str, int]] = {}
+        self._resolved_members: dict[int, discord.Member] = {}
+        self._member_lookups: dict[str, tuple[list[discord.Member], bool, str] | DiscordToolError] = {}
+        self._member_lookup_lock = asyncio.Lock()
+        self._audit_log_search = None
+
+    def _target_ref(self, kind: str, target_id: int) -> str:
+        target = (kind, int(target_id))
+        for ref, existing in self._target_refs.items():
+            if existing == target:
+                return ref
+        ref = f"ref:{self._reference_nonce}:{kind}:{len(self._target_refs) + 1}"
+        self._target_refs[ref] = target
+        return ref
 
     async def execute(
         self,
@@ -230,8 +248,14 @@ class DiscordToolHost:
         arguments: dict[str, object],
     ) -> dict[str, object]:
         normalized = str(action or "").strip().casefold()
+        if normalized.startswith("cosmetic_"):
+            from .cosmetic_roles import CosmeticRoleHost
+            return await CosmeticRoleHost(self).execute(normalized[9:], arguments)
         if normalized not in _QUERY_ACTIONS | _MANAGE_ACTIONS:
             raise DiscordToolError(f"unsupported Discord action: {normalized}")
+        if arguments.get("guild_id") not in (None, ""):
+            if self._coerce_id(arguments["guild_id"], "guild_id") != self._guild().id:
+                raise DiscordToolError("cross-guild targets are not allowed")
         if normalized in _QUERY_ACTIONS:
             return await self._query(normalized, arguments)
         return await self._manage(normalized, arguments)
@@ -266,16 +290,19 @@ class DiscordToolHost:
                     },
                     "channel": {
                         "id": str(channel.id),
+                        "channelRef": self._target_ref("channel", channel.id),
                         "name": getattr(channel, "name", ""),
                         "type": str(getattr(channel, "type", "unknown")),
                     },
                     "requester": {
                         "id": str(self.message.author.id),
+                        "userRef": self._target_ref("member", self.message.author.id),
                         "name": self.message.author.display_name,
                         "isOwner": self._is_owner(),
                         "isGuildOwner": self._is_guild_owner(),
                         "isAdministrator": self._is_guild_administrator(),
                         "canManageGuild": self._can_manage_guild(),
+                        "canViewAuditLog": self._can_view_audit_log(self._requester_member()),
                     },
                     "bot": {
                         "id": str(self.bot.user.id) if self.bot.user is not None else "",
@@ -309,6 +336,7 @@ class DiscordToolHost:
                 channels.append(
                     {
                         "id": str(channel.id),
+                        "channelRef": self._target_ref("channel", channel.id),
                         "name": channel.name,
                         "type": str(channel.type),
                         "categoryId": str(channel.category_id) if channel.category_id else None,
@@ -335,15 +363,21 @@ class DiscordToolHost:
         if action == "members":
             query = str(arguments.get("query") or "").strip().casefold()
             limit = self._bounded_int(arguments.get("limit"), default=25, maximum=100)
-            members = []
-            for member in guild.members:
-                searchable = f"{member.id} {member.name} {member.display_name}".casefold()
-                if query and query not in searchable:
-                    continue
-                members.append(self._member_payload(member))
-                if len(members) >= limit:
-                    break
-            return self._result(f"Returned {len(members)} cached member(s).", members)
+            found, complete, source = await self._lookup_members(query)
+            members = [self._member_payload(member) for member in found[:limit]]
+            detail = (
+                " Supply a username/global display name/nickname prefix for live search; this is not the full guild member list."
+                if not query and not complete
+                else " Search is prefix-based; zero results do not prove the person is absent. Try their complete username or mention."
+                if not members and source == "Discord REST member search"
+                else " More candidates may exist; narrow the name or ask for a mention."
+                if not complete
+                else ""
+            )
+            return self._result(
+                f"Returned {len(members)} member(s) from {source}.{detail}", members,
+                truncated=not complete or len(found) > limit,
+            )
 
         if action == "member":
             member = await self._member_from_arguments(arguments)
@@ -477,6 +511,7 @@ class DiscordToolHost:
                         "authorId": str(item.author.id),
                         "author": item.author.display_name,
                         "content": item.content[:1500],
+                        "forwardedContext": forwarded_context(item, max_chars=2500),
                         "createdAt": item.created_at.isoformat(),
                         "attachmentNames": [attachment.filename for attachment in item.attachments[:10]],
                     }
@@ -486,22 +521,13 @@ class DiscordToolHost:
             return self._result(f"Read {len(messages)} recent message(s).", messages)
 
         if action == "audit_log":
-            self._require_guild_manager()
-            limit = self._bounded_int(arguments.get("limit"), default=20, maximum=50)
-            entries = []
-            async for entry in guild.audit_logs(limit=limit):
-                entries.append(
-                    {
-                        "id": str(entry.id),
-                        "action": str(entry.action),
-                        "actorId": str(entry.user.id) if entry.user else None,
-                        "actor": str(entry.user) if entry.user else None,
-                        "target": str(entry.target)[:300],
-                        "reason": entry.reason,
-                        "createdAt": entry.created_at.isoformat(),
-                    }
-                )
-            return self._result(f"Read {len(entries)} audit-log entrie(s).", entries)
+            from .audit_log import AuditLogSearch, AuditLogSearchError
+            if self._audit_log_search is None:
+                self._audit_log_search = AuditLogSearch(self)
+            try:
+                return await self._audit_log_search.read(arguments)
+            except AuditLogSearchError as exc:
+                raise DiscordToolError(str(exc)) from None
 
         raise DiscordToolError(f"unsupported Discord query: {action}")
 
@@ -519,6 +545,7 @@ class DiscordToolHost:
             raise DiscordToolError(
                 "delete_messages requires after_message_id or before_message_id"
             )
+        arguments = await self._prepare_manage_targets(action, arguments)
         if action in _DESTRUCTIVE_ACTIONS:
             await self._confirm_destructive_action(action, arguments)
             # Administrator roles can change while the reaction prompt is
@@ -1133,6 +1160,75 @@ class DiscordToolHost:
                 "or Administrator permission in this guild"
             )
 
+    def _can_view_audit_log(self, member: object) -> bool:
+        guild = self._guild()
+        if getattr(member, "id", None) != self.message.author.id:
+            return False
+        if getattr(getattr(member, "guild", None), "id", guild.id) != guild.id:
+            return False
+        permissions = getattr(member, "guild_permissions", None)
+        return bool(
+            member.id == guild.owner_id
+            or getattr(permissions, "administrator", False)
+            or getattr(permissions, "view_audit_log", False)
+        )
+
+    async def _require_audit_log_access(self) -> None:
+        guild = self._guild()
+        # Do not inherit a developer override, an old message's roles, or
+        # Administrator membership from another guild. Fail closed on lookup.
+        try:
+            member = await asyncio.wait_for(guild.fetch_member(self.message.author.id), timeout=10)
+        except (discord.HTTPException, OSError, asyncio.TimeoutError) as exc:
+            raise DiscordToolError("无法核实当前服务器的查看审核日志权限，已拒绝读取。") from exc
+        if not self._can_view_audit_log(member):
+            raise DiscordToolError(
+                "拒绝读取审核日志：你没有当前服务器的「查看审核日志」权限 (view_audit_log)。"
+            )
+        bot_permissions = getattr(guild.me, "guild_permissions", None)
+        if not (getattr(bot_permissions, "administrator", False) or getattr(bot_permissions, "view_audit_log", False)):
+            raise DiscordToolError("BOT 缺少当前服务器的「查看审核日志」权限 (view_audit_log)。")
+
+    async def _prepare_manage_targets(
+        self, action: str, arguments: dict[str, object]
+    ) -> dict[str, object]:
+        """Validate IDs and freeze name/handle targets before asking for consent."""
+        args = dict(arguments)
+        for key, raw in list(args.items()):
+            if key.endswith("_id") and raw not in (None, ""):
+                label = f"{args.get('target_type') or 'role'}_id" if key == "target_id" else key
+                args[key] = str(self._coerce_id(raw, label))
+        if "role_ids" in args:
+            raw_roles = args["role_ids"]
+            if not isinstance(raw_roles, list) or len(raw_roles) > 100:
+                raise DiscordToolError("role_ids must be an array of at most 100 exact role references")
+            args["role_ids"] = [str(self._coerce_id(raw, "role_id")) for raw in raw_roles]
+        if args.get("user_ref") not in (None, "") or args.get("user_id") not in (None, ""):
+            member_id = (
+                await self._user_id_from_arguments(args)
+                if action == "unban_member"
+                else (await self._member_from_arguments(args)).id
+            )
+            args["user_ref"] = str(member_id)
+            args.pop("user_id", None)
+        if args.get("role_ref") not in (None, "") or args.get("role_id") not in (None, ""):
+            args["role_ref"] = str(self._role_from_arguments(args).id)
+            args.pop("role_id", None)
+        if action == "delete_messages":
+            channel = await self._message_channel(args.get("channel_id"))
+            args["channel_id"] = str(channel.id)
+            # A snowflake is also a timestamp. Discord accepts an unrelated
+            # channel's ID as a range boundary, so existence must be checked.
+            for key in ("after_message_id", "before_message_id"):
+                if args.get(key) not in (None, ""):
+                    try:
+                        await channel.fetch_message(self._coerce_id(args[key], key))
+                    except (discord.NotFound, discord.Forbidden) as exc:
+                        raise DiscordToolError(
+                            f"{key} was not found or is inaccessible in the selected channel; nothing deleted"
+                        ) from exc
+        return args
+
     def _require_manage_action_authorized(self, action: str) -> None:
         if action in _BOT_OWNER_ONLY_MANAGE_ACTIONS:
             self._require_owner()
@@ -1259,13 +1355,78 @@ class DiscordToolHost:
 
     async def _member(self, user_id: int) -> discord.Member:
         guild = self._guild()
-        member = guild.get_member(user_id)
+        member = self._resolved_members.get(user_id) or guild.get_member(user_id)
         if member is None:
             try:
                 member = await guild.fetch_member(user_id)
             except (discord.NotFound, discord.Forbidden) as exc:
                 raise DiscordToolError("member was not found in the current guild") from exc
         return member
+
+    @staticmethod
+    def _member_names(member: discord.Member) -> set[str]:
+        return {
+            str(getattr(member, key, "") or "").casefold()
+            for key in ("name", "display_name", "global_name")
+        } - {""}
+
+    async def _fetch_live_members(self, query: str) -> list[discord.Member]:
+        """REST search works without turning on privileged Gateway member intents."""
+        guild = self._guild()
+        http = getattr(self.bot, "http", None)
+        if http is None or not callable(getattr(http, "request", None)):
+            raise DiscordToolError("member cache is incomplete and live member lookup is unavailable")
+        route = discord.http.Route("GET", "/guilds/{guild_id}/members/search", guild_id=guild.id)
+        data = await asyncio.wait_for(http.request(route, params={"query": query, "limit": 100}), timeout=12)
+        if not isinstance(data, list) or len(data) > 100:
+            raise DiscordToolError("Discord returned an invalid member search response")
+        members = []
+        for row in data:
+            if not isinstance(row, dict) or not isinstance(row.get("user"), dict):
+                raise DiscordToolError("Discord returned an invalid member search entry")
+            self._coerce_id(row["user"].get("id"), "user_id")
+            members.append(discord.Member(data=row, guild=guild, state=guild._state))
+        return members
+
+    async def _lookup_members(self, query: str) -> tuple[list[discord.Member], bool, str]:
+        query = query.strip().removeprefix("@").casefold()
+        if len(query) > 100:
+            raise DiscordToolError("member query must contain at most 100 characters")
+        # Deduplicate repeated/parallel lookups in one turn, including failures.
+        # Never turn a network/permission failure into an authoritative empty list.
+        async with self._member_lookup_lock:
+            previous = self._member_lookups.get(query)
+            if isinstance(previous, DiscordToolError):
+                raise previous
+            if previous is not None:
+                return previous
+            guild = self._guild()
+            cached = list(getattr(guild, "members", []))
+            complete = bool(getattr(guild, "chunked", True))
+            direct_id = re.fullmatch(r"<@!?(\d+)>|([1-9][0-9]{14,19})", query)
+            try:
+                if direct_id:
+                    member_id = self._coerce_id(direct_id.group(1) or direct_id.group(2), "user_id")
+                    found = [await self._member(member_id)]
+                    result = (found, True, "exact member ID lookup")
+                elif not query or complete:
+                    found = [member for member in cached if not query or query in str(member.id) or any(query in name for name in self._member_names(member))]
+                    result = (found, complete, "current guild member cache")
+                else:
+                    found = await self._fetch_live_members(query)
+                    # Hitting the API cap cannot prove a name is unique.
+                    result = (found, len(found) < 100, "Discord REST member search")
+                for member in result[0]:
+                    self._resolved_members[member.id] = member
+                self._member_lookups[query] = result
+                return result
+            except (discord.HTTPException, OSError, asyncio.TimeoutError, ValueError, TypeError, KeyError, DiscordToolError) as exc:
+                failure = exc if isinstance(exc, DiscordToolError) else DiscordToolError(
+                    "实时成员查询暂不可用，不能据此判断成员不存在；本轮不会重复请求同一查询。"
+                    f" (live member lookup failed: {type(exc).__name__})"
+                )
+                self._member_lookups[query] = failure
+                raise failure from None
 
     async def _member_from_arguments(
         self,
@@ -1274,7 +1435,11 @@ class DiscordToolHost:
         raw = arguments.get("user_ref")
         if raw in {None, ""}:
             raw = arguments.get("user_id")
-        return await self._resolve_member_ref(raw)
+        member = await self._resolve_member_ref(raw)
+        if arguments.get("user_ref") not in (None, "") and arguments.get("user_id") not in (None, ""):
+            if self._coerce_id(arguments["user_id"], "user_id") != member.id:
+                raise DiscordToolError("user_ref and user_id identify different members; query again")
+        return member
 
     async def _user_id_from_arguments(
         self,
@@ -1283,18 +1448,23 @@ class DiscordToolHost:
         raw = arguments.get("user_ref")
         if raw in {None, ""}:
             raw = arguments.get("user_id")
-        text = str(raw or "").strip()
-        mention = re.fullmatch(r"<@!?(\d+)>", text)
-        if mention:
-            text = mention.group(1)
-        if text.isdecimal():
-            return self._coerce_id(text, "user_ref")
-        return (await self._resolve_member_ref(text)).id
+        if isinstance(raw, (int, float, bool)):
+            result = self._coerce_id(raw, "user_ref")
+        elif isinstance(raw, str) and (raw.strip().startswith("ref:") or re.fullmatch(r"(?:[0-9]+|<@!?[0-9]+>)", raw.strip())):
+            text = raw.strip()
+            mention = re.fullmatch(r"<@!?(\d+)>", text)
+            result = self._coerce_id(mention.group(1) if mention else text, "user_ref")
+        else:
+            result = (await self._resolve_member_ref(raw)).id
+        if arguments.get("user_ref") not in (None, "") and arguments.get("user_id") not in (None, ""):
+            if self._coerce_id(arguments["user_id"], "user_id") != result:
+                raise DiscordToolError("user_ref and user_id identify different members; query again")
+        return result
 
     async def _resolve_member_ref(self, raw: object) -> discord.Member:
-        if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        if not isinstance(raw, str):
             return await self._member(self._coerce_id(raw, "user_ref"))
-        text = str(raw or "").strip()
+        text = raw.strip()
         if not text:
             raise DiscordToolError(
                 "user_ref must be a member name, display name, mention, or quoted snowflake"
@@ -1302,51 +1472,41 @@ class DiscordToolHost:
         mention = re.fullmatch(r"<@!?(\d+)>", text)
         if mention:
             text = mention.group(1)
-        if text.isdecimal():
+        if text.isdecimal() or text.startswith("ref:"):
             return await self._member(self._coerce_id(text, "user_ref"))
 
         query = text.removeprefix("@").casefold()
-        members = list(getattr(self._guild(), "members", []))
+        if not query:
+            raise DiscordToolError("user_ref requires a complete member name or mention")
+        members, complete, _source = await self._lookup_members(query)
         exact = [
             member
             for member in members
             if query
-            in {
-                str(getattr(member, "name", "") or "").casefold(),
-                str(getattr(member, "display_name", "") or "").casefold(),
-                str(getattr(member, "global_name", "") or "").casefold(),
-            }
+            in self._member_names(member)
         ]
-        if len(exact) == 1:
+        if len(exact) == 1 and complete:
             return exact[0]
-        partial = [
-            member
-            for member in members
-            if query
-            and any(
-                query in candidate
-                for candidate in (
-                    str(getattr(member, "name", "") or "").casefold(),
-                    str(getattr(member, "display_name", "") or "").casefold(),
-                    str(getattr(member, "global_name", "") or "").casefold(),
-                )
-                if candidate
-            )
-        ]
-        matches = exact or partial
-        if len(matches) == 1:
-            return matches[0]
-        if len(matches) > 1:
+        if not complete:
+            raise DiscordToolError("member search reached its limit; cannot verify a unique name. Use a queried userRef or ask for a mention")
+        if len(exact) > 1:
             raise DiscordToolError(
                 "user_ref matches multiple current-guild members; call members with query first"
             )
-        raise DiscordToolError("user_ref did not match a member in the current guild")
+        raise DiscordToolError("user_ref did not exactly match a member in the current guild; query members first or ask for a mention. Partial names are not action targets")
 
     def _role_from_arguments(self, arguments: dict[str, object]) -> discord.Role:
         raw = arguments.get("role_ref")
         if raw in {None, ""}:
             raw = arguments.get("role_id")
-        if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        role = self._resolve_role_ref(raw)
+        if arguments.get("role_ref") not in (None, "") and arguments.get("role_id") not in (None, ""):
+            if self._coerce_id(arguments["role_id"], "role_id") != role.id:
+                raise DiscordToolError("role_ref and role_id identify different roles; query again")
+        return role
+
+    def _resolve_role_ref(self, raw: object) -> discord.Role:
+        if not isinstance(raw, str):
             return self._role(self._coerce_id(raw, "role_ref"))
         text = str(raw or "").strip()
         if not text:
@@ -1356,7 +1516,7 @@ class DiscordToolHost:
         mention = re.fullmatch(r"<@&(\d+)>", text)
         if mention:
             text = mention.group(1)
-        if text.isdecimal():
+        if text.isdecimal() or text.startswith("ref:"):
             return self._role(self._coerce_id(text, "role_ref"))
         query = text.removeprefix("@").casefold()
         roles = list(getattr(self._guild(), "roles", []))
@@ -1365,19 +1525,13 @@ class DiscordToolHost:
             for role in roles
             if str(getattr(role, "name", "") or "").casefold() == query
         ]
-        partial = [
-            role
-            for role in roles
-            if query in str(getattr(role, "name", "") or "").casefold()
-        ]
-        matches = exact or partial
-        if len(matches) == 1:
-            return matches[0]
-        if len(matches) > 1:
+        if len(exact) == 1:
+            return exact[0]
+        if len(exact) > 1:
             raise DiscordToolError(
                 "role_ref matches multiple current-guild roles; call roles first"
             )
-        raise DiscordToolError("role_ref did not match a role in the current guild")
+        raise DiscordToolError("role_ref did not exactly match a role in the current guild; query roles first. Partial names are not action targets")
 
     async def resolve_visual_sources(
         self,
@@ -2201,15 +2355,15 @@ class DiscordToolHost:
     def _enabled_permissions(permissions: discord.Permissions) -> list[str]:
         return [name for name, enabled in permissions if enabled]
 
-    @staticmethod
-    def _member_payload(member: discord.Member) -> dict[str, object]:
+    def _member_payload(self, member: discord.Member) -> dict[str, object]:
         return {
             "id": str(member.id),
+            "userRef": self._target_ref("member", member.id),
             "name": member.name,
             "displayName": member.display_name,
             "bot": member.bot,
             "joinedAt": member.joined_at.isoformat() if member.joined_at else None,
-            "roles": [{"id": str(role.id), "name": role.name} for role in member.roles[1:]],
+            "roles": [{"id": str(role.id), "roleRef": self._target_ref("role", role.id), "name": role.name} for role in member.roles[1:]],
             "avatar": DiscordToolHost._avatar_payload(member),
         }
 
@@ -2250,12 +2404,10 @@ class DiscordToolHost:
             "url": str(sticker.url),
         }
 
-    @staticmethod
-    def _channel_payload(channel: Any) -> dict[str, object]:
-        return {"id": str(channel.id), "name": channel.name, "type": str(channel.type)}
+    def _channel_payload(self, channel: Any) -> dict[str, object]:
+        return {"id": str(channel.id), "channelRef": self._target_ref("channel", channel.id), "name": channel.name, "type": str(channel.type)}
 
-    @staticmethod
-    def _role_payload(role: discord.Role) -> dict[str, object]:
+    def _role_payload(self, role: discord.Role) -> dict[str, object]:
         primary = getattr(role, "colour", getattr(role, "color", None))
         secondary = getattr(
             role,
@@ -2284,6 +2436,7 @@ class DiscordToolHost:
         display_icon = getattr(role, "display_icon", None)
         return {
             "id": str(role.id),
+            "roleRef": self._target_ref("role", role.id),
             "name": role.name,
             "position": role.position,
             "colorStyle": style,
@@ -2392,12 +2545,22 @@ class DiscordToolHost:
             raise DiscordToolError(f"text exceeds {maximum} characters")
         return text or None
 
-    @classmethod
-    def _required_id(cls, arguments: dict[str, object], key: str) -> int:
-        return cls._coerce_id(arguments.get(key), key)
+    def _required_id(self, arguments: dict[str, object], key: str) -> int:
+        label = f"{arguments.get('target_type') or 'role'}_id" if key == "target_id" else key
+        return self._coerce_id(arguments.get(key), label)
 
-    @staticmethod
-    def _coerce_id(value: object, label: str) -> int:
+    def _coerce_id(self, value: object, label: str) -> int:
+        if isinstance(value, str) and value.strip().startswith("ref:"):
+            target = self._target_refs.get(value.strip())
+            expected = (
+                "member" if label in {"user_ref", "user_id", "author_id", "member_id"}
+                else "role" if label in {"role_ref", "role_id"}
+                else "channel" if label in {"channel_id", "category_id", "voice_channel_id"}
+                else None
+            )
+            if target is None or target[0] != expected:
+                raise DiscordToolError(f"{label}: stale, unknown, or wrong-type target reference; run a fresh query in this guild")
+            return target[1]
         if isinstance(value, bool):
             raise DiscordToolError(
                 f"{label} must be a Discord snowflake id encoded as a quoted decimal string"
@@ -2411,10 +2574,9 @@ class DiscordToolHost:
             raise DiscordToolError(
                 f"{label} must be a Discord snowflake id encoded as a quoted decimal string"
             )
-        try:
-            parsed = int(str(value).strip())
-        except (TypeError, ValueError) as exc:
-            raise DiscordToolError(f"{label} must be a Discord snowflake id") from exc
+        if not isinstance(value, (int, str)) or not re.fullmatch(r"[1-9][0-9]{0,19}", str(value).strip()):
+            raise DiscordToolError(f"{label} must be an exact ASCII decimal Discord snowflake id")
+        parsed = int(str(value).strip())
         if parsed <= 0 or parsed >= 2**64:
             raise DiscordToolError(f"{label} must be a positive Discord snowflake id")
         return parsed

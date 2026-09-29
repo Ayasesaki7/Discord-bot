@@ -3,14 +3,19 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-import os, aiohttp, time, asyncio, re, json, shutil, random, hashlib
+import os, time, asyncio, re, json, shutil, random, hashlib
 import urllib.parse
 import urllib.request
 import copy
+import tempfile
+from .audio import FALLBACK_SEARCH_PREFIXES, AudioPipeline, public_http_url, safe_error
+from .lyrics import parse_lrc, next_refresh_delay
+from .search import search_songs
+from .access import is_voice_channel, panel_destination
 from datetime import datetime, timezone
 from http.cookies import SimpleCookie
 from pathlib import Path
-from .ui import MusicInterface, SearchResultView
+from .ui import BaseView, MusicInterface, SearchResultView, DEFAULT_COVER_PATH, DEFAULT_COVER_FILENAME
 from .auth import setup_async
 try:
     from ..config import config
@@ -28,11 +33,15 @@ except ImportError:
     yt_dlp = None
 
 
-DIRECT_AUDIO_TIMEOUT_SECONDS = 60
 MAX_DIRECT_AUDIO_BYTES = 200 * 1024 * 1024
 
 
 class Music(commands.Cog):
+    # Defaults, overridable through MUSIC_* environment variables in __init__.
+    cache_max_age_seconds = 30 * 86400
+    cache_max_bytes = 20 * 1024 ** 3
+    preload_depth = 3
+    fallback_sources = ("bilibili", "youtube")
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -40,13 +49,32 @@ class Music(commands.Cog):
         self.queues = {}
         self.agent_locks = {}
         self.download_locks = {}
+        self.download_jobs = {}
+        self.download_failures = {}
+        self.download_slots = asyncio.Semaphore(4)
+        # Background prefetch never holds every download slot, so a song
+        # someone is waiting for can always start downloading.
+        self.prefetch_slots = asyncio.Semaphore(2)
+        self.prefetch_keys = set()
+        self.voice_locks = {}
+        self.background_tasks = set()
+        self.lyric_cache = {}
+        self.lyric_jobs = {}
+        self.lyric_slots = asyncio.Semaphore(4)
+        self.qq_audio_blocked_until = 0.0
+        self.max_queue_length = 200
         self.music_logged_in = False  # QQ ?????????????????????????
         self.cache_root = Path(__file__).resolve().parents[1] / "music_cache"
+        self.cache_max_age_seconds = max(3600, self._env_hours("MUSIC_CACHE_MAX_AGE_HOURS", 720.0))
+        self.cache_max_bytes = max(256, self._env_int("MUSIC_CACHE_MAX_MB", 20480)) * 1024 * 1024
+        self.preload_depth = max(1, min(10, self._env_int("MUSIC_PRELOAD_DEPTH", 3)))
+        self.fallback_sources = self._resolve_fallback_sources()
         self.qqmusic_cookie_file = Path(
             os.getenv("QQMUSIC_COOKIE_FILE", "").strip()
             or (Path(__file__).resolve().parents[1] / "config" / "credentials" / "qqmusic_cookie.txt")
         )
         self.ffmpeg_executable = self._resolve_ffmpeg_executable()
+        self.audio = AudioPipeline(self.ffmpeg_executable, max_bytes=MAX_DIRECT_AUDIO_BYTES)
         self.qqmusic_cookie_source = "none"
         self.qqmusic_cookie = self._load_qqmusic_cookie()
         self.qqmusic_quality = os.getenv("QQMUSIC_QUALITY", "auto").strip().lower()
@@ -114,11 +142,34 @@ class Music(commands.Cog):
                 self._periodic_qqmusic_cookie_refresher()
             )
 
-    def cog_unload(self):
-        if self.cleaner_task:
-            self.cleaner_task.cancel()
-        if self.qqmusic_refresh_task:
-            self.qqmusic_refresh_task.cancel()
+    def _spawn(self, coroutine):
+        task = asyncio.create_task(coroutine)
+        self.background_tasks.add(task)
+
+        def done(finished):
+            self.background_tasks.discard(finished)
+            if not finished.cancelled() and finished.exception() is not None:
+                print(f"[WARN] Music task failed: {safe_error(finished.exception())}")
+
+        task.add_done_callback(done)
+        return task
+
+    async def cog_unload(self):
+        tasks = set(self.background_tasks) | set(self.download_jobs.values())
+        for data in self.queues.values():
+            data["stopping"] = True
+            data["voice_generation"] = data.get("voice_generation", 0) + 1
+            tasks.update(t for t in (data.get("progress_task"), data.get("preload_task"),
+                                     data.get("play_task")) if t is not None)
+        tasks.update(t for t in (self.cleaner_task, self.qqmusic_refresh_task) if t is not None)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        for guild_id in self.queues:
+            guild = self.bot.get_guild(guild_id)
+            if guild and guild.voice_client:
+                await guild.voice_client.disconnect(force=True)
+        await self.audio.close()
 
     @commands.Cog.listener()
     async def on_ready(self):
@@ -128,43 +179,49 @@ class Music(commands.Cog):
                 self.bot, getattr(config, "OWNER_ID", 0)
             )
 
+    def _clean_audio_cache(self):
+        protected = set(self.download_locks)
+        for data in self.queues.values():
+            for song in [data.get("current"), *data.get("queue", [])]:
+                if song:
+                    protected.add(self._cache_key(song))
+                    if song.get("local_path"):
+                        protected.add(Path(song["local_path"]).stem)
+        files = []
+        for path in self.cache_root.iterdir():
+            if path.is_file() and not path.is_symlink() and path.suffix in {".mp3", ".opus", ".tmp"}:
+                try:
+                    files.append((path, path.stat()))
+                except OSError:
+                    pass
+        total = sum(info.st_size for _, info in files)
+        removed = 0
+        for path, info in sorted(files, key=lambda entry: entry[1].st_mtime):
+            if path.stem in protected:
+                continue
+            # Cache hits refresh mtime, so this evicts least-recently-played first.
+            if time.time() - info.st_mtime <= self.cache_max_age_seconds and total <= self.cache_max_bytes:
+                continue
+            try:
+                path.unlink(missing_ok=True)
+                total -= info.st_size
+                removed += 1
+            except OSError:
+                pass
+        return removed
+
     async def _periodic_cache_cleaner(self):
         await self.bot.wait_until_ready()
-        EXPIRE_TIME = 3600
-
-        while not self.bot.is_closed():
-            try:
-                await asyncio.sleep(60)
-                now = time.time()
-                removed_count = 0
-                total_size_freed = 0
-
-                if self.cache_root.exists():
-                    for file_path in self.cache_root.glob("*.mp3"):
-                        if file_path.stem in self.download_locks:
-                            continue
-
-                        try:
-                            stats = file_path.stat()
-                            if now - stats.st_mtime > EXPIRE_TIME:
-                                file_size = stats.st_size
-                                os.remove(file_path)
-                                removed_count += 1
-                                total_size_freed += file_size
-                        except Exception:
-                            pass
-
-                if removed_count > 0:
-                    mb_freed = total_size_freed / (1024 * 1024)
-                    print(
-                        f"[OK] 缓存清理完成：删除 {removed_count} 个文件，释放 {mb_freed:.2f} MB 空间"
-                    )
+        try:
+            while not self.bot.is_closed():
                 await asyncio.sleep(600)
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                print(f"[WARN] 缓存清理任务出错: {e}")
-                await asyncio.sleep(60)
+                # Snapshot and deletion stay on the event loop: no race with a new
+                # playback acquiring the same cache between protection and unlink.
+                removed = self._clean_audio_cache()
+                if removed:
+                    print(f"[INFO] Music cache cleaned: files={removed}")
+        except asyncio.CancelledError:
+            return
 
     def _resolve_ffmpeg_executable(self):
         ffmpeg_executable = shutil.which("ffmpeg")
@@ -230,6 +287,18 @@ class Music(commands.Cog):
         except ValueError:
             print(f"[WARN] {key} must be an integer; using {default}")
             return default
+
+    def _resolve_fallback_sources(self) -> tuple[str, ...]:
+        raw = os.getenv("MUSIC_FALLBACK_SOURCES")
+        if raw is None:
+            return type(self).fallback_sources
+        sources = []
+        for name in raw.replace(",", " ").lower().split():
+            if name not in FALLBACK_SEARCH_PREFIXES:
+                print(f"[WARN] MUSIC_FALLBACK_SOURCES ignores unknown source {name[:40]!r}")
+            elif name not in sources:
+                sources.append(name)
+        return tuple(sources)
 
     def _env_hours(self, key: str, default: float) -> int:
         raw_value = os.getenv(key, "").strip()
@@ -351,6 +420,8 @@ class Music(commands.Cog):
             "[INFO] QQ Music credential hot-reloaded: "
             f"configured={bool(self.qqmusic_cookie)}"
         )
+        self.download_failures.clear()
+        self.qq_audio_blocked_until = 0.0
         return bool(self.qqmusic_cookie)
 
     def _serialize_cookie_map(self, cookie_map: dict[str, str]) -> str:
@@ -781,7 +852,9 @@ class Music(commands.Cog):
             ],
         }
         selected = quality_map.get(preferred, quality_map["auto"])
-        return [(f"{prefix}{target}{suffix}", suffix) for prefix, suffix, target in selected]
+        excluded = song.get("_qq_failed_files", set()) | song.get("_qq_unavailable_files", set())
+        return [(f"{prefix}{target}{suffix}", suffix) for prefix, suffix, target in selected
+                if f"{prefix}{target}{suffix}" not in excluded]
 
     def _build_fallback_query(self, song: dict) -> str:
         artists = ", ".join(
@@ -789,16 +862,39 @@ class Music(commands.Cog):
             for artist in song.get("ar", [])
             if isinstance(artist, dict) and artist.get("name")
         )
-        return " ".join(part for part in [song.get("name"), artists, "audio"] if part)
+        return " ".join(part for part in [song.get("name"), artists] if part)
+
+    def _fallback_cookie_file(self, source: str, directory: Path) -> Path | None:
+        """Give yt-dlp a private copy of a Netscape Bilibili cookie file, if any.
+
+        yt-dlp writes its cookie jar back on exit; the protected credential
+        must never be rewritten by a search subprocess.
+        """
+        raw = os.getenv("BILIBILI_COOKIE_FILE", "").strip()
+        if source != "bilibili" or not raw:
+            return None
+        path = Path(raw)
+        if not path.is_absolute():
+            path = Path(__file__).resolve().parents[1] / path
+        try:
+            with path.open(encoding="utf-8-sig") as stream:
+                if "HTTP Cookie File" not in stream.readline():
+                    return None  # A raw Cookie header is not something yt-dlp can load.
+            copy_path = directory / "fallback-cookies.txt"
+            shutil.copyfile(path, copy_path)
+            copy_path.chmod(0o600)
+            return copy_path
+        except OSError:
+            return None
 
     def _normalize_direct_audio_url(self, raw_url: str) -> str | None:
         url = raw_url.strip()
         if not url:
             return None
-        parsed = urllib.parse.urlparse(url)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        try:
+            return public_http_url(url)
+        except ValueError:
             return None
-        return url
 
     def _direct_audio_name_from_url(self, url: str) -> str:
         parsed = urllib.parse.urlparse(url)
@@ -824,46 +920,6 @@ class Music(commands.Cog):
             "direct_url": url,
         }
 
-    def _download_song_with_ytdlp(self, song: dict, file_path_obj: Path):
-        if yt_dlp is None:
-            return None
-
-        search_query = self._build_fallback_query(song)
-        if not search_query:
-            return None
-
-        ydl_opts = {
-            "format": "bestaudio/best",
-            "quiet": True,
-            "no_warnings": True,
-            "noplaylist": True,
-            "noprogress": True,
-            "overwrites": True,
-            "outtmpl": str(file_path_obj.with_suffix(".%(ext)s")),
-            "postprocessors": [
-                {
-                    "key": "FFmpegExtractAudio",
-                    "preferredcodec": "mp3",
-                    "preferredquality": "192",
-                }
-            ],
-        }
-        if self.ffmpeg_executable:
-            ydl_opts["ffmpeg_location"] = self.ffmpeg_executable
-
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.extract_info(f"ytsearch1:{search_query}", download=True)
-        except Exception as exc:
-            print(f"[WARN] yt-dlp fallback failed for {song.get('name')}: {exc}")
-            return None
-
-        if file_path_obj.exists() and file_path_obj.stat().st_size > 1024:
-            file_path = str(file_path_obj)
-            song["local_path"] = file_path
-            return file_path
-        return None
-
     def _get_or_create_queue(self, guild_id: int):
         if guild_id not in self.queues:
             self.queues[guild_id] = {
@@ -880,7 +936,13 @@ class Music(commands.Cog):
                 "priority_next": None,
                 "voice_generation": 0,
                 "stopping": False,
+                "ui_lock": asyncio.Lock(),
+                "play_task": None,
+                "preload_task": None,
                 "agent_phase": "idle",
+                "playback_failed": False,
+                "lyrics_enabled": True,
+                "lyrics_task": None,
                 "agent_last_error": None,
                 "agent_state_version": 0,
                 "agent_last_transition": None,
@@ -909,36 +971,24 @@ class Music(commands.Cog):
         queue_list = queue_data["queue"]
         if not queue_list:
             queue_data["priority_next"] = None
+            queue_data["shuffle_next"] = None
             return None
-
-        priority_index = self._priority_next_index(
-            queue_list, queue_data.get("priority_next")
-        )
-        if priority_index is not None:
-            return priority_index
-
+        priority = self._priority_next_index(queue_list, queue_data.get("priority_next"))
+        if priority is not None:
+            return priority
         queue_data["priority_next"] = None
-        if queue_data.get("play_mode", "sequential") == "shuffle":
-            return random.randrange(len(queue_list))
+        if queue_data.get("play_mode") == "shuffle":
+            selected = self._priority_next_index(queue_list, queue_data.get("shuffle_next"))
+            if selected is None:
+                selected = random.randrange(len(queue_list))
+                queue_data["shuffle_next"] = queue_list[selected]
+            return selected
         return 0
 
     def _preview_next_song(self, guild_id: int):
-        queue_data = self._get_or_create_queue(guild_id)
-        queue_list = queue_data["queue"]
-        if not queue_list:
-            queue_data["priority_next"] = None
-            return None
-
-        priority_index = self._priority_next_index(
-            queue_list, queue_data.get("priority_next")
-        )
-        if priority_index is not None:
-            return queue_list[priority_index]
-
-        queue_data["priority_next"] = None
-        if queue_data.get("play_mode", "sequential") == "shuffle":
-            return random.choice(queue_list)
-        return queue_list[0]
+        data = self._get_or_create_queue(guild_id)
+        index = self._select_next_song_index(data)
+        return data["queue"][index] if index is not None else None
 
     def toggle_play_mode(self, guild_id: int):
         queue_data = self._get_or_create_queue(guild_id)
@@ -946,36 +996,77 @@ class Music(commands.Cog):
         queue_data["play_mode"] = (
             "shuffle" if current_mode == "sequential" else "sequential"
         )
+        queue_data["shuffle_next"] = None
         return queue_data["play_mode"]
 
     # --- UI 更新逻辑 ---
+    def _panel_uploads(self, view, message=None):
+        """Attach the default image once per panel, not on every lyric refresh."""
+        if not getattr(view, "uses_default_cover", False):
+            return []
+        attachments = getattr(message, "attachments", ())
+        if any(item.filename == DEFAULT_COVER_FILENAME for item in attachments):
+            return []
+        return [discord.File(DEFAULT_COVER_PATH, filename=DEFAULT_COVER_FILENAME)]
+
+    async def _send_player_panel(self, channel, view):
+        if not is_voice_channel(channel):
+            raise ValueError('音乐面板只能发送到语音频道的文字聊天区。')
+        uploads = self._panel_uploads(view)
+        try:
+            return await channel.send(view=view, files=uploads, allowed_mentions=discord.AllowedMentions.none())
+        finally:
+            for upload in uploads:
+                upload.close()
+
+    async def _edit_player_panel(self, message, view):
+        uploads = self._panel_uploads(view, message)
+        kwargs = {}
+        if uploads:
+            kwargs["attachments"] = list(getattr(message, "attachments", ())) + uploads
+        try:
+            return await message.edit(view=view, allowed_mentions=discord.AllowedMentions.none(), **kwargs)
+        finally:
+            for upload in uploads:
+                upload.close()
+
     async def update_player_ui(self, guild_id: int):
-        if guild_id not in self.queues:
+        data = self.queues.get(guild_id)
+        if not data:
             return
-
-        data = self.queues[guild_id]
-        view: MusicInterface = data["view"]
-        view.update_container()
-
-        message = data.get("message")
-        channel = data.get("channel")
-
-        # 优先尝试编辑现有消息
-        if message:
-            try:
-                await message.edit(view=view)
-                return  # 编辑成功后直接返回
-            except (discord.NotFound, discord.HTTPException):
-                # 消息已删除或不可用，清空引用
-                data["message"] = None
-
-        # 如果消息不存在但频道还在，就补发一条新消息
-        if not data["message"] and channel:
-            try:
-                new_msg = await channel.send(view=view)
-                data["message"] = new_msg
-            except Exception as send_err:
-                print(f"[WARN] 重新发送面板消息失败: {send_err}")
+        async with data.setdefault("ui_lock", asyncio.Lock()):
+            target = panel_destination(self.bot.get_guild(guild_id), data)
+            if target is None:
+                return
+            data['channel'] = target
+            previous_message = data.get('message')
+            if previous_message and getattr(getattr(previous_message, 'channel', None), 'id', None) != target.id:
+                # Only this tracked, bot-created player card is retired; other
+                # channel messages are untouched. Old text-channel buttons are
+                # also rejected by BaseView even if Discord refuses deletion.
+                await self._delete_panel_message(guild_id)
+            view = data["view"]
+            view.update_container()
+            message = data.get("message")
+            if message:
+                try:
+                    edited = await self._edit_player_panel(message, view)
+                    # discord.py returns a NEW Message; keep its attachment list
+                    # so the next lyric refresh does not upload the image again.
+                    if isinstance(edited, discord.Message):
+                        data["message"] = edited
+                    return
+                except discord.NotFound:
+                    data["message"] = None
+                except discord.HTTPException as exc:
+                    # Rate limits/transient failures do not mean the panel was deleted.
+                    print(f"[WARN] Music panel edit deferred: status={exc.status}")
+                    return
+            if data.get("channel"):
+                try:
+                    data["message"] = await self._send_player_panel(data["channel"], view)
+                except discord.HTTPException as exc:
+                    print(f"[WARN] Music panel send failed: status={exc.status}")
 
     async def _delete_panel_message(self, guild_id: int):
         if guild_id not in self.queues:
@@ -1017,54 +1108,44 @@ class Music(commands.Cog):
         except Exception:
             pass
 
-    async def _ensure_voice_client_for(self, guild, member):
-        if not guild or not getattr(member, "voice", None):
+    async def _ensure_voice_client_for(self, guild, member, *, expected_channel_id=None):
+        if not guild or not getattr(getattr(member, "voice", None), "channel", None):
             return None
-
-        guild_id = guild.id
-        target_channel = member.voice.channel
-        vc = guild.voice_client
-        self._drop_stale_voice_client(vc)
-        vc = guild.voice_client
-
-        if vc and vc.channel != target_channel:
-            await vc.move_to(target_channel)
-            return vc
-
-        if not vc:
-            await self._respect_voice_reconnect_delay(guild_id)
+        async with self.voice_locks.setdefault(guild.id, asyncio.Lock()):
+            # Member location may have changed while searching/waiting for a lock.
+            target = getattr(getattr(member, "voice", None), "channel", None)
+            if target is None or (expected_channel_id is not None and target.id != expected_channel_id):
+                return None
             vc = guild.voice_client
             self._drop_stale_voice_client(vc)
             vc = guild.voice_client
-            if vc:
-                if vc.channel != target_channel:
-                    await vc.move_to(target_channel)
+            if vc and vc.is_connected():
+                if vc.channel != target:
+                    raise RuntimeError("请加入 BOT 当前所在的语音频道后再操作。")
                 return vc
-            return await target_channel.connect()
-
-        return vc
+            await self._respect_voice_reconnect_delay(guild.id)
+            if getattr(getattr(member, "voice", None), "channel", None) != target:
+                return None
+            return await target.connect(timeout=20, reconnect=True)
 
     async def _ensure_voice_client(self, interaction: discord.Interaction):
         return await self._ensure_voice_client_for(
             interaction.guild,
             interaction.user,
+            expected_channel_id=interaction.channel.id,
         )
 
-    def _handle_track_finished(
-        self, guild_id: int, generation: int, error: Exception | None
-    ) -> None:
+    def _handle_track_finished(self, guild_id: int, generation: int, error: Exception | None) -> None:
+        data = self.queues.get(guild_id)
+        if (not data or data.get("stopping") or data.get("voice_generation") != generation
+                or data.get("finished_generation") == generation):
+            return
+        data["finished_generation"] = generation
         if error:
-            print(f"FFmpeg Error: {error}")
-
-        queue_data = self.queues.get(guild_id)
-        if not queue_data:
-            return
-        if queue_data.get("stopping"):
-            return
-        if queue_data.get("voice_generation") != generation:
-            return
-
-        self.play_next(guild_id)
+            self._spawn(self._play_failed(guild_id, data["current"], generation, safe_error(error)))
+        else:
+            data["error_count"] = 0
+            self.play_next(guild_id)
 
     def _qq_request_json(
         self,
@@ -1073,6 +1154,7 @@ class Music(commands.Cog):
         method: str = "GET",
         data=None,
         headers: dict | None = None,
+        timeout: float = 20,
     ):
         request_headers = self._qq_request_headers(headers)
 
@@ -1087,8 +1169,10 @@ class Music(commands.Cog):
         req = urllib.request.Request(
             url, data=payload, headers=request_headers, method=method
         )
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            raw_bytes = resp.read()
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw_bytes = resp.read(2 * 1024 * 1024 + 1)
+            if len(raw_bytes) > 2 * 1024 * 1024:
+                raise RuntimeError("QQ Music metadata response is too large")
             response_charset = resp.headers.get_content_charset()
 
         raw = self._decode_response_text(raw_bytes, response_charset)
@@ -1142,8 +1226,8 @@ class Music(commands.Cog):
             "mid": songmid,
             "media_mid": song.get("file", {}).get("media_mid") or song.get("strMediaMid"),
             "name": (
-                song.get("name")
-                or song.get("title")
+                song.get("title")
+                or song.get("name")
                 or song.get("songname")
                 or song.get("songorig")
                 or "未知歌曲"
@@ -1173,62 +1257,23 @@ class Music(commands.Cog):
         return None
 
     def _search_song(self, query: str):
-        try:
-            keyword = query.strip()
-            if not keyword:
-                return None
-
-            result = self._qq_request_json(
-                "https://c.y.qq.com/splcloud/fcgi-bin/smartbox_new.fcg?"
-                f"key={urllib.parse.quote(keyword)}&format=json"
-            )
-            songs = result.get("data", {}).get("song", {}).get("itemlist", [])
-            for song in songs:
-                song_mid = song.get("mid")
-                if not song_mid:
-                    continue
-                detail = self._get_song_detail(song_mid)
-                if detail:
-                    return self._normalize_song_data(detail)
-
-            if songs:
-                return self._normalize_song_data(songs[0])
-        except Exception as e:
-            print(f"QQ 音乐搜索失败: {e}")
-        return None
+        candidates = self._search_song_candidates(query)
+        return candidates[0] if candidates else None
 
     def _search_song_candidates(self, query: str, limit: int = 8):
         try:
-            keyword = query.strip()
-            if not keyword:
-                return []
-
-            result = self._qq_request_json(
-                "https://c.y.qq.com/splcloud/fcgi-bin/smartbox_new.fcg?"
-                f"key={urllib.parse.quote(keyword)}&format=json"
-            )
-            items = result.get("data", {}).get("song", {}).get("itemlist", [])
+            items = search_songs(self._qq_request_json, query, limit=limit)
             candidates = []
-            seen_mids = set()
-
             for item in items:
-                song_mid = item.get("mid")
-                if not song_mid or song_mid in seen_mids:
-                    continue
-                seen_mids.add(song_mid)
-
-                detail = self._get_song_detail(song_mid)
-                if detail:
-                    candidates.append(self._normalize_song_data(detail))
-                else:
+                try:
+                    # Full search already provides album/artwork, singers,
+                    # duration and media MID. No N+1 detail lookups needed.
                     candidates.append(self._normalize_song_data(item))
-
-                if len(candidates) >= limit:
-                    break
-
+                except (TypeError, ValueError, AttributeError):
+                    continue
             return candidates
         except Exception as e:
-            print(f"QQ 音乐候选搜索失败: {e}")
+            print(f"[WARN] QQ full song search failed: {type(e).__name__}")
             return []
 
     def _copy_song_for_queue(self, song: dict, requester: str):
@@ -1237,6 +1282,8 @@ class Music(commands.Cog):
         return song_copy
 
     def _get_song_url(self, song: dict):
+        # A preview must not inherit the quality label from a previous attempt.
+        song.pop("qq_filename", None)
         try:
             song_mid = song.get("mid")
             if not song_mid:
@@ -1283,7 +1330,10 @@ class Music(commands.Cog):
                     song["qq_filename"] = filename
                     song["qq_audio_base"] = base
                     return urllib.parse.urljoin(base, purl)
+                song.setdefault("_qq_unavailable_files", set()).add(filename)
 
+            if song.get("_qq_skip_preview"):
+                return None
             detail_result = self._qq_request_json(
                 "https://c.y.qq.com/v8/fcg-bin/fcg_play_single_song.fcg?"
                 f"songmid={urllib.parse.quote(song_mid)}&tpl=yqq_song_detail&format=json"
@@ -1297,7 +1347,7 @@ class Music(commands.Cog):
                     return preview_url
                 return f"https://{preview_url.lstrip('/')}"
         except Exception as e:
-            print(f"QQ 音乐获取播放链接失败: {e}")
+            print(f"QQ 音乐获取播放链接失败: {safe_error(e)}")
         return None
 
     def _extract_collection_id(self, link: str, c_type: str):
@@ -1348,227 +1398,189 @@ class Music(commands.Cog):
         return songs, f"专辑: {album_data.get('name', '未知')}", cover
 
     # --- 下载与缓存（优化版） ---
+    def _cache_key(self, song):
+        identity = song.get("direct_url") if song.get("source") == "direct_url" else str(song.get("id"))
+        identity = f"{song.get('source', 'qq')}:{identity}:opus128"
+        return "v2_" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:32]
+
     async def _download_qq_audio_url(self, url: str, song: dict, file_path: str):
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/123.0.0.0 Safari/537.36"
-            ),
-            "Referer": "https://y.qq.com/",
-            "Origin": "https://y.qq.com",
-        }
-        if self.qqmusic_cookie:
-            headers["Cookie"] = self.qqmusic_cookie
-
-        async with aiohttp.ClientSession(headers=headers) as session:
-            async with session.get(url) as resp:
-                if resp.status == 200:
-                    content = await resp.read()
-                    if len(content) > 1024:
-                        temp_path = file_path + ".tmp"
-                        with open(temp_path, "wb") as f:
-                            f.write(content)
-                        os.rename(temp_path, file_path)
-
-                        song["local_path"] = file_path
-                        self.qq_download_403_count = 0
-                        return file_path, resp.status
-
-                if resp.status == 403:
-                    self.qq_download_403_count += 1
-                print(
-                    "[WARN] QQ audio request returned status "
-                    f"{resp.status} for {song.get('name')} "
-                    f"(filename={song.get('qq_filename', 'unknown')}, "
-                    f"base={song.get('qq_audio_base', 'unknown')}, "
-                    f"consecutive_403={self.qq_download_403_count})"
-                )
-                if resp.status == 403 and self.qq_download_403_count >= 2:
-                    print(
-                        "[WARN] QQ Music audio was rejected repeatedly; cookie may be expired or risk-controlled. "
-                        "Trying automatic cookie refresh before falling back."
-                    )
-                return None, resp.status
+        status = await self.audio.download(url, Path(file_path), cookie=self.qqmusic_cookie)
+        if status == 200:
+            self.qq_download_403_count = 0
+            return file_path, status
+        if status in {403, 429}:
+            self.qq_download_403_count += 1
+        print(f"[WARN] QQ audio rejected: status={status}")
+        return None, status
 
     async def _download_direct_audio_url(self, url: str, song: dict, file_path: str):
-        timeout = aiohttp.ClientTimeout(total=DIRECT_AUDIO_TIMEOUT_SECONDS)
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/123.0.0.0 Safari/537.36"
-            ),
-            "Accept": "audio/*,*/*;q=0.8",
-        }
-
-        temp_path = file_path + ".tmp"
-        try:
-            async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-                async with session.get(url, allow_redirects=True) as resp:
-                    if resp.status != 200:
-                        print(
-                            "[WARN] direct audio request returned status "
-                            f"{resp.status} for {song.get('name')} ({url})"
-                        )
-                        return None
-
-                    content_length = resp.headers.get("Content-Length")
-                    if content_length:
-                        try:
-                            if int(content_length) > MAX_DIRECT_AUDIO_BYTES:
-                                print(
-                                    "[WARN] direct audio file is too large: "
-                                    f"{content_length} bytes ({url})"
-                                )
-                                return None
-                        except ValueError:
-                            pass
-
-                    total_size = 0
-                    with open(temp_path, "wb") as f:
-                        async for chunk in resp.content.iter_chunked(1024 * 256):
-                            if not chunk:
-                                continue
-                            total_size += len(chunk)
-                            if total_size > MAX_DIRECT_AUDIO_BYTES:
-                                print(
-                                    "[WARN] direct audio download exceeded size limit "
-                                    f"({MAX_DIRECT_AUDIO_BYTES} bytes): {url}"
-                                )
-                                return None
-                            f.write(chunk)
-
-                    if total_size <= 1024:
-                        print(f"[WARN] direct audio response was too small: {url}")
-                        return None
-
-            os.replace(temp_path, file_path)
-            song["local_path"] = file_path
-            return file_path
-        finally:
-            if os.path.exists(temp_path):
-                try:
-                    os.remove(temp_path)
-                except OSError:
-                    pass
+        status = await self.audio.download(url, Path(file_path))
+        return file_path if status == 200 else None
 
     async def _try_download_song(self, song):
-        """
-        下载歌曲，使用全局缓存和并发锁。
-        """
         if not song:
             return None
+        key = self._cache_key(song)
+        path = self.cache_root / f"{key}.opus"
+        if self.audio.valid_cache(path):
+            os.utime(path, None)
+            song["local_path"] = str(path)
+            return str(path)
+        if self.download_failures.get(key, 0) > time.monotonic():
+            return None
+        job = self.download_jobs.get(key)
+        if job is None:
+            lock = asyncio.Lock()
+            self.download_locks[key] = lock
+            job = asyncio.create_task(self._download_song_job(copy.deepcopy(song), path, lock))
+            self.download_jobs[key] = job
 
-        song_id = str(song["id"])
-        file_path_obj = self.cache_root / f"{song_id}.mp3"
-        file_path = str(file_path_obj)
+            def done(task):
+                # One owner cleans up only after ALL work has stopped. Waiters
+                # never delete a lock or cancel a shared download.
+                if self.download_jobs.get(key) is task:
+                    self.download_jobs.pop(key, None)
+                    self.download_locks.pop(key, None)
+                if not task.cancelled() and task.exception() is not None:
+                    print(f"[WARN] Music download task failed: {safe_error(task.exception())}")
 
-        if file_path_obj.exists() and file_path_obj.stat().st_size > 1024:
-            song["local_path"] = file_path
-            return file_path
+            job.add_done_callback(done)
+        result = await asyncio.shield(job)
+        if result:
+            song["local_path"] = result
+        return result
 
-        if song_id not in self.download_locks:
-            self.download_locks[song_id] = asyncio.Lock()
-
-        async with self.download_locks[song_id]:
-            if file_path_obj.exists() and file_path_obj.stat().st_size > 1024:
-                song["local_path"] = file_path
-                return file_path
-
-            if song.get("source") == "direct_url":
-                direct_url = self._normalize_direct_audio_url(song.get("direct_url", ""))
-                if not direct_url:
-                    print(f"[WARN] invalid direct audio URL for {song.get('name')}")
-                    return None
-                try:
-                    return await self._download_direct_audio_url(
-                        direct_url, song, file_path
-                    )
-                except Exception as e:
-                    print(
-                        f"[WARN] direct audio download failed for "
-                        f"{song.get('name')}: {e}"
-                    )
-                    return None
-
-            url = await asyncio.to_thread(self._get_song_url, song)
-            if not url and self.qqmusic_cookie:
-                refreshed = await self._refresh_qqmusic_cookie_if_needed(
-                    force=True, reason="empty song url"
-                )
-                if refreshed:
-                    url = await asyncio.to_thread(self._get_song_url, song)
-                else:
-                    await self._send_qqmusic_cookie_dm(
-                        "empty_song_url_refresh_failed",
-                        self._qqmusic_cookie_status_message(
-                            "QQ Music could not return an official playback URL, "
-                            "and automatic cookie refresh did not recover it."
-                        ),
-                    )
-
+    async def _download_song_job(self, song, path, lock):
+        key = path.stem
+        async with lock, self.download_slots:
+            work_dir = Path(tempfile.mkdtemp(prefix="music_", dir=self.cache_root))
             try:
-                if url:
-                    downloaded_path, status = await self._download_qq_audio_url(
-                        url, song, file_path
-                    )
-                    if downloaded_path:
-                        return downloaded_path
-
-                    if status == 403 and self.qqmusic_cookie:
-                        refreshed = await self._refresh_qqmusic_cookie_if_needed(
-                            force=True, reason="403 audio download"
-                        )
-                        if refreshed:
-                            retry_url = await asyncio.to_thread(self._get_song_url, song)
-                            if retry_url:
-                                (
-                                    downloaded_path,
-                                    retry_status,
-                                ) = await self._download_qq_audio_url(
-                                    retry_url, song, file_path
-                                )
-                                if downloaded_path:
-                                    return downloaded_path
-                                if retry_status == 403:
-                                    await self._send_qqmusic_cookie_dm(
-                                        "audio_403_after_refresh",
-                                        self._qqmusic_cookie_status_message(
-                                            "QQ Music audio still returned 403 after automatic cookie refresh."
-                                        ),
-                                    )
-                        else:
-                            await self._send_qqmusic_cookie_dm(
-                                "audio_403_refresh_failed",
-                                self._qqmusic_cookie_status_message(
-                                    "QQ Music audio returned 403, "
-                                    "and automatic cookie refresh did not recover it."
-                                ),
-                            )
-
-                fallback_path = await asyncio.to_thread(
-                    self._download_song_with_ytdlp, song, file_path_obj
-                )
-                if fallback_path:
-                    return fallback_path
-            except Exception as e:
-                print(f"[WARN] audio download failed for {song.get('name')}: {e}")
-                if os.path.exists(file_path):
-                    os.remove(file_path)
-                if os.path.exists(file_path + ".tmp"):
-                    os.remove(file_path + ".tmp")
+                result = await self._acquire_audio(song, work_dir, path)
+                if not result:
+                    self.download_failures[key] = time.monotonic() + 60
+                    while len(self.download_failures) > 512:
+                        self.download_failures.pop(next(iter(self.download_failures)))
+                return result
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.download_failures[key] = time.monotonic() + 60
+                while len(self.download_failures) > 512:
+                    self.download_failures.pop(next(iter(self.download_failures)))
+                print(f"[WARN] Audio acquisition failed: {safe_error(exc)}")
+                return None
             finally:
-                if song_id in self.download_locks:
-                    del self.download_locks[song_id]
+                shutil.rmtree(work_dir, ignore_errors=True)
 
+    async def _acquire_audio(self, song, directory, destination):
+        raw = directory / "source.audio"
+        prepared = directory / "prepared.opus"
+
+        async def finish(source):
+            await self.audio.prepare(Path(source), prepared)
+            os.replace(prepared, destination)
+            return str(destination)
+
+        if song.get("source") == "direct_url":
+            url = self._normalize_direct_audio_url(song.get("direct_url", ""))
+            if not url:
+                return None
+            path = await self._download_direct_audio_url(url, song, str(raw))
+            return await finish(path) if path else None
+
+        if time.monotonic() >= self.qq_audio_blocked_until:
+            try:
+                async with asyncio.timeout(180):
+                    result = await self._acquire_qq_audio(song, raw, finish)
+                    if result:
+                        return result
+            except TimeoutError:
+                print("[WARN] Official audio acquisition exceeded 180 seconds")
+            except Exception as exc:
+                print(f"[WARN] Official audio unavailable: {safe_error(exc)}")
+
+        query = self._build_fallback_query(song) if yt_dlp is not None else ""
+        duration = (song.get("dt") or 0) / 1000 or None
+        for source in self.fallback_sources if query else ():
+            # One source being blocked or returning a bad file must not stop
+            # the next one; each attempt is bounded by the pipeline timeouts.
+            try:
+                path = await self.audio.fallback(
+                    f"{query} audio" if source == "youtube" else query, directory,
+                    source=source, duration=duration,
+                    cookie_file=self._fallback_cookie_file(source, directory),
+                )
+                if path:
+                    result = await finish(path)
+                    print(f"[OK] Fallback audio prepared: source={source}")
+                    return result
+                print(f"[WARN] Fallback audio found no match: source={source}")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                print(f"[WARN] Fallback audio failed: source={source}; {safe_error(exc)}")
         return None
 
-    async def _smart_cache_clean(self, guild_id: int):
-        pass
+    async def _acquire_qq_audio(self, song, raw, finish):
+        # Four auto qualities + legacy preview + ONE independent cookie refresh.
+        # Never discard both MP3 variants when just the 320 kbps file is bad.
+        max_attempts = len(self._qq_quality_candidates(song)) + 2
+        refresh_attempted = False
+        failed_urls = set()
+        for _ in range(max_attempts):
+            try:
+                url = await asyncio.to_thread(self._get_song_url, song)
+            except Exception as exc:
+                print(f"[WARN] Official audio unavailable: {safe_error(exc)}")
+                break
+            if not url:
+                if self.qqmusic_cookie and not refresh_attempted:
+                    refresh_attempted = True
+                    if await self._refresh_qqmusic_cookie_if_needed(force=True, reason="empty song url"):
+                        song.pop("_qq_unavailable_files", None)
+                        continue
+                break
+
+            filename = song.get("qq_filename", "")
+            quality = filename[:4] if filename else "preview"
+            # Ignore changing signatures: a bad URL must not be downloaded again
+            # if another quality/preview points at the same physical file.
+            parsed = urllib.parse.urlsplit(url)
+            identity = (parsed.hostname, parsed.path)
+            status = None
+            try:
+                if identity in failed_urls:
+                    raise RuntimeError("QQ returned an already failed audio file")
+                path, status = await self._download_qq_audio_url(url, song, str(raw))
+                if path:
+                    result = await finish(path)
+                    print(f"[OK] Official audio prepared: quality={quality}")
+                    return result
+            except Exception as exc:
+                print(f"[WARN] Official audio failed: quality={quality}; {safe_error(exc)}")
+
+            if status in {403, 429}:
+                if status == 403 and self.qqmusic_cookie and not refresh_attempted:
+                    refresh_attempted = True
+                    if await self._refresh_qqmusic_cookie_if_needed(force=True, reason="403 audio download"):
+                        song.pop("_qq_unavailable_files", None)
+                        continue
+                # An authorization/rate-limit error is not a damaged file. Do
+                # not hammer all qualities with the same rejected credential.
+                self.qq_audio_blocked_until = time.monotonic() + 120
+                break
+
+            failed_urls.add(identity)
+            if filename:
+                song.setdefault("_qq_failed_files", set()).add(filename)
+                print(f"[WARN] Official audio moving to next quality after {quality}; status={status}")
+            else:
+                song["_qq_skip_preview"] = True
+                break
+        return None
 
     def play_next(self, guild_id: int):
-        if guild_id not in self.queues:
+        if guild_id not in self.queues or self.queues[guild_id].get("stopping"):
             return
 
         self._stop_progress_task(guild_id)
@@ -1580,11 +1592,13 @@ class Music(commands.Cog):
                 return
             next_song = queue_data["queue"].pop(next_index)
             queue_data["priority_next"] = None
+            queue_data["shuffle_next"] = None
             queue_data["current"] = next_song
             queue_data["agent_phase"] = "loading"
+            queue_data["playback_failed"] = False
             queue_data["agent_last_error"] = None
-            asyncio.create_task(self.update_player_ui(guild_id))
-            asyncio.create_task(self._play_music_task(guild_id, next_song))
+            self._spawn(self.update_player_ui(guild_id))
+            self._spawn(self._play_music_task(guild_id, next_song))
         else:
             queue_data["current"] = None
             queue_data["start_time"] = None
@@ -1592,91 +1606,107 @@ class Music(commands.Cog):
             queue_data["play_mode"] = "sequential"
             queue_data["priority_next"] = None
             queue_data["agent_phase"] = "idle"
+            queue_data["playback_failed"] = False
             queue_data["agent_last_error"] = None
-            asyncio.create_task(self.update_player_ui(guild_id))
+            self._spawn(self.update_player_ui(guild_id))
+
+    def _play_is_current(self, guild_id, song, generation):
+        data = self.queues.get(guild_id)
+        return bool(data and not data.get("stopping") and data.get("current") is song
+                    and data.get("voice_generation") == generation)
+
+    async def _play_failed(self, guild_id, song, generation, error):
+        if not self._play_is_current(guild_id, song, generation):
+            return
+        data = self.queues[guild_id]
+        data["agent_phase"] = "error"
+        data["playback_failed"] = True
+        data["agent_last_error"] = safe_error(error)
+        data["error_count"] += 1
+        await self.update_player_ui(guild_id)
+        if not self._play_is_current(guild_id, song, generation):
+            return
+        guild = self.bot.get_guild(guild_id)
+        connected = guild and guild.voice_client and guild.voice_client.is_connected()
+        if connected and data["queue"] and data["error_count"] < 3:
+            await asyncio.sleep(min(data["error_count"] * 2, 6))
+            if self._play_is_current(guild_id, song, generation):
+                self.play_next(guild_id)
+        elif (destination := panel_destination(guild, data)) is not None:
+            await destination.send(
+                "本曲播放未成功，已停止自动尝试；剩余队列保留。重新点歌会恢复播放，也可以点「跳过」。",
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
 
     async def _play_music_task(self, guild_id: int, song):
         guild = self.bot.get_guild(guild_id)
-        if not guild:
+        data = self.queues.get(guild_id)
+        if not guild or not data or data.get("stopping") or data.get("current") is not song:
             return
-        queue_data = self.queues.get(guild_id)
-        if not queue_data or queue_data.get("stopping"):
-            return
-        queue_data["agent_phase"] = "loading"
-        queue_data["agent_last_error"] = None
-        vc = guild.voice_client
-        self._drop_stale_voice_client(vc)
-        vc = guild.voice_client
-        if not vc or not vc.is_connected():
-            queue_data["agent_phase"] = "error"
-            queue_data["agent_last_error"] = "voice connection unavailable"
-            return
-
-        file_path = song.get("local_path")
-        if not file_path or not os.path.exists(file_path):
-            file_path = await self._try_download_song(song)
-
-        if queue_data.get("stopping"):
-            return
-
-        if not file_path:
-            print(f"[WARN] unable to acquire audio file for {song['name']}")
-            queue_data["agent_phase"] = "error"
-            queue_data["agent_last_error"] = "audio acquisition failed"
-            self.queues[guild_id]["error_count"] += 1
-            if self.queues[guild_id]["error_count"] < 5:
-                await asyncio.sleep(1)
-                self.play_next(guild_id)
-            else:
-                if self.queues[guild_id]["channel"]:
-                    await self.queues[guild_id]["channel"].send(
-                        "连续播放失败次数过多，队列已停止。"
-                    )
-            return
-        try:
-            os.utime(file_path, None)
-        except Exception as e:
-            print(f"[WARN] failed to update cache timestamp: {e}")
-
-        # 重置连续错误计数
-        self.queues[guild_id]["error_count"] = 0
-        ffmpeg_opts = {"options": "-vn"}
+        task = asyncio.current_task()
+        previous = data.get("play_task")
+        if previous and not previous.done() and previous is not task:
+            if data.get("play_task_song") is song:
+                return
+            previous.cancel()
+        data["play_task"] = task
+        data["play_task_song"] = song
         generation = self._advance_voice_generation(guild_id)
-
-        def after_callback(error):
-            if self.loop is not None:
-                self.loop.call_soon_threadsafe(
-                    self._handle_track_finished, guild_id, generation, error
-                )
-
-        if vc.is_playing() or vc.is_paused():
-            vc.stop()
-
+        data["agent_phase"] = "loading"
+        data["playback_failed"] = False
+        data["agent_last_error"] = None
+        data["start_time"] = None
+        data["paused_elapsed"] = 0
+        source = None
+        handed_to_voice = False
         try:
-            if self.ffmpeg_executable:
-                source = discord.FFmpegPCMAudio(
-                    file_path, executable=self.ffmpeg_executable, **ffmpeg_opts
-                )
-            else:
-                source = discord.FFmpegPCMAudio(file_path, **ffmpeg_opts)
+            if not guild.voice_client or not guild.voice_client.is_connected():
+                await self._play_failed(guild_id, song, generation, "语音连接不可用")
+                return
+            file_path = await self._try_download_song(song)
+            if not self._play_is_current(guild_id, song, generation):
+                return
+            # Never use a VoiceClient captured before a potentially long download.
+            vc = guild.voice_client
+            if not vc or not vc.is_connected():
+                await self._play_failed(guild_id, song, generation, "语音连接已断开")
+                return
+            if not file_path:
+                await self._play_failed(guild_id, song, generation, "音源获取或解码失败")
+                return
+            if vc.is_playing() or vc.is_paused():
+                vc.stop()
+
+            def after_callback(error):
+                if self.loop is not None and not self.loop.is_closed():
+                    self.loop.call_soon_threadsafe(self._handle_track_finished, guild_id, generation, error)
+
+            source = discord.FFmpegOpusAudio(
+                file_path, codec="opus", executable=self.ffmpeg_executable or "ffmpeg",
+                options="-vn", before_options="-nostdin -loglevel warning",
+            )
             vc.play(source, after=after_callback)
-
-            self.queues[guild_id]["agent_phase"] = "playing"
-            self.queues[guild_id]["agent_last_error"] = None
-
-            self.queues[guild_id]["start_time"] = time.time()
-            self.queues[guild_id]["paused_elapsed"] = 0
-
-            await self.update_player_ui(guild_id)
+            handed_to_voice = True
+            data["agent_phase"] = "playing"
+            data["start_time"] = time.time()
+            data["paused_elapsed"] = 0
             self._start_progress_task(guild_id)
-            asyncio.create_task(self._preload_next(guild_id))
-
-        except Exception as e:
-            print(f"播放异常: {e}")
-            self.queues[guild_id]["agent_phase"] = "error"
-            self.queues[guild_id]["agent_last_error"] = e.__class__.__name__
-            await asyncio.sleep(1)
-            self.play_next(guild_id)
+            self._begin_lyrics(guild_id, song)
+            self._spawn(self._preload_next(guild_id))
+            await self.update_player_ui(guild_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # A UI/network edit failure must never skip a successfully started song.
+            if not handed_to_voice:
+                await self._play_failed(guild_id, song, generation, safe_error(exc))
+            else:
+                print(f"[WARN] Music UI update failed: {safe_error(exc)}")
+        finally:
+            if source is not None and not handed_to_voice:
+                source.cleanup()
+            if data.get("play_task") is task:
+                data["play_task"] = None
 
     async def _play_music(self, interaction: discord.Interaction, song):
         guild_id = interaction.guild_id
@@ -1690,12 +1720,104 @@ class Music(commands.Cog):
             await self._play_music_task(guild_id, song)
 
     async def _preload_next(self, guild_id):
-        """Preload the next track in the queue."""
-        if guild_id not in self.queues:
+        data = self.queues.get(guild_id)
+        if not data or data.get("stopping"):
             return
-        next_song = self._preview_next_song(guild_id)
-        if next_song:
-            asyncio.create_task(self._try_download_song(next_song))
+        song = self._preview_next_song(guild_id)
+        previous = data.get("preload_task")
+        if previous and not previous.done():
+            if data.get("preload_song") is song:
+                return
+            previous.cancel()
+        data["preload_song"] = song
+        data["preload_task"] = self._spawn(self._try_download_song(song)) if song else None
+        self._prefetch_upcoming(data, song)
+
+    def _prefetch_upcoming(self, data, next_song):
+        # Shuffle only fixes the very next pick; sequential order is known, so
+        # warm a few more tracks through the small shared prefetch budget.
+        if next_song is None or data.get("play_mode") == "shuffle":
+            return
+        upcoming = [s for s in data["queue"][:self.preload_depth] if s is not next_song]
+        for song in upcoming[:self.preload_depth - 1]:
+            key = self._cache_key(song)
+            if key in self.prefetch_keys or key in self.download_jobs:
+                continue
+            # While QQ is cooling down, prefetch would only burn fallback searches.
+            if song.get("source") != "direct_url" and time.monotonic() < self.qq_audio_blocked_until:
+                continue
+            self.prefetch_keys.add(key)
+            self._spawn(self._prefetch_song(key, song))
+
+    async def _prefetch_song(self, key, song):
+        try:
+            async with self.prefetch_slots:
+                await self._try_download_song(song)
+        finally:
+            self.prefetch_keys.discard(key)
+
+    async def _fetch_lyrics(self, key, song):
+        async with self.lyric_slots:
+            try:
+                result = await asyncio.to_thread(
+                    self._qq_request_json,
+                    "https://c.y.qq.com/lyric/fcgi-bin/fcg_query_lyric_new.fcg?"
+                    f"songmid={urllib.parse.quote(str(song['mid']))}&format=json&nobase64=1",
+                )
+                if result.get("code", 0) != 0:
+                    raise RuntimeError("QQ lyrics endpoint unavailable")
+                lines = parse_lrc(result.get("lyric"))
+                state = "ready" if lines else "missing"
+            except Exception as exc:
+                print(f"[WARN] Lyrics unavailable: {type(exc).__name__}")
+                lines, state = [], "error"
+            self.lyric_cache[key] = (time.monotonic() + (86400 if lines else 300), lines, state)
+            while len(self.lyric_cache) > 1024:
+                self.lyric_cache.pop(next(iter(self.lyric_cache)))
+            return lines, state
+
+    def _begin_lyrics(self, guild_id, song):
+        data = self.queues.get(guild_id)
+        if not data:
+            return
+        task = data.get("lyrics_task")
+        if task and not task.done():
+            task.cancel()
+        if data.get("lyrics_enabled", True):
+            data["lyrics_task"] = self._spawn(self._load_song_lyrics(guild_id, song))
+
+    async def _load_song_lyrics(self, guild_id, song):
+        data = self.queues.get(guild_id)
+        if not data or data.get("current") is not song or data.get("stopping"):
+            return
+        if not song.get("mid") or song.get("source") == "direct_url":
+            song["lyrics"], song["lyrics_state"] = [], "missing"
+            return
+        key = str(song["mid"])
+        cached = self.lyric_cache.get(key)
+        if cached and cached[0] > time.monotonic():
+            lines, state = cached[1:]
+        else:
+            song["lyrics_state"] = "loading"
+            job = self.lyric_jobs.get(key)
+            if job is None:
+                job = self._spawn(self._fetch_lyrics(key, song))
+                self.lyric_jobs[key] = job
+
+                def done(finished):
+                    if self.lyric_jobs.get(key) is finished:
+                        self.lyric_jobs.pop(key, None)
+
+                job.add_done_callback(done)
+            lines, state = await asyncio.shield(job)
+        if data is self.queues.get(guild_id) and data.get("current") is song and not data.get("stopping"):
+            song["lyrics"], song["lyrics_state"] = lines, state
+            if data.get("lyrics_enabled", True):
+                await self.update_player_ui(guild_id)
+                guild = self.bot.get_guild(guild_id)
+                if (data.get("current") is song and guild and guild.voice_client
+                        and guild.voice_client.is_playing()):
+                    self._start_progress_task(guild_id)
 
     # --- 进度条任务 ---
     def _stop_progress_task(self, guild_id: int):
@@ -1704,7 +1826,7 @@ class Music(commands.Cog):
         task = self.queues[guild_id].get("progress_task")
         if task and not task.done():
             task.cancel()
-            self.queues[guild_id]["progress_task"] = None
+        self.queues[guild_id]["progress_task"] = None
 
     def _start_progress_task(self, guild_id: int):
         self._stop_progress_task(guild_id)
@@ -1714,7 +1836,12 @@ class Music(commands.Cog):
     async def _progress_updater(self, guild_id: int):
         try:
             while True:
-                await asyncio.sleep(10)  # 每 10 秒刷新一次
+                data = self.queues.get(guild_id) or {}
+                elapsed = data.get("paused_elapsed", 0)
+                if data.get("start_time"):
+                    elapsed += max(0, time.time() - data["start_time"])
+                lines = (data.get("current") or {}).get("lyrics", []) if data.get("lyrics_enabled", True) else []
+                await asyncio.sleep(next_refresh_delay(lines, elapsed))
                 if guild_id not in self.queues:
                     break
 
@@ -1736,11 +1863,18 @@ class Music(commands.Cog):
     # --- 对外调用接口 ---
 
     async def stop_handling(self, guild_id: int):
+        async with self.voice_locks.setdefault(guild_id, asyncio.Lock()):
+            await self._stop_handling_locked(guild_id)
+
+    async def _stop_handling_locked(self, guild_id: int):
         """Stop playback and clear the queue."""
         self._stop_progress_task(guild_id)
         if guild_id in self.queues:
             queue_data = self.queues[guild_id]
             queue_data["stopping"] = True
+            for task in (queue_data.get("play_task"), queue_data.get("preload_task"), queue_data.get("lyrics_task")):
+                if task and not task.done() and task is not asyncio.current_task():
+                    task.cancel()
             queue_data["agent_phase"] = "stopping"
             queue_data["voice_generation"] = queue_data.get("voice_generation", 0) + 1
             queue_data["current"] = None
@@ -1772,13 +1906,15 @@ class Music(commands.Cog):
 
             await self.update_player_ui(guild_id)
 
-    async def prioritize_song(self, interaction: discord.Interaction, song_index: int):
+    async def prioritize_song(self, interaction: discord.Interaction, song_index: int, *, expected_song=None):
         """Move a queued song to play next."""
         guild_id = interaction.guild_id
         if guild_id not in self.queues:
             return False
 
         queue_list = self.queues[guild_id]["queue"]
+        if expected_song is not None:
+            song_index = next((i for i, item in enumerate(queue_list) if item is expected_song), -1)
         if song_index < 0 or song_index >= len(queue_list):
             return False
 
@@ -1786,9 +1922,92 @@ class Music(commands.Cog):
         queue_list.insert(0, song)
         self.queues[guild_id]["priority_next"] = song
 
-        asyncio.create_task(self._preload_next(guild_id))
+        self._spawn(self._preload_next(guild_id))
         await self.update_player_ui(guild_id)
         return song["name"]
+
+    async def remove_pending_songs(self, guild_id: int, expected_songs):
+        """Remove only still-pending snapshot objects; never remove a new/current track."""
+        data = self.queues.get(guild_id)
+        if not data or data.get("stopping"):
+            return 0
+        identities = {id(song) for song in expected_songs}
+        previous_count = len(data["queue"])
+        data["queue"][:] = [song for song in data["queue"] if id(song) not in identities]
+        removed = previous_count - len(data["queue"])
+        if removed:
+            for key in ("priority_next", "shuffle_next"):
+                if self._priority_next_index(data["queue"], data.get(key)) is None:
+                    data[key] = None
+            self._spawn(self._preload_next(guild_id))
+            await self.update_player_ui(guild_id)
+        return removed
+
+    async def skip_current(self, guild_id: int, expected_song):
+        """Also allow skipping loading/failed tracks, without trusting an old panel."""
+        data = self.queues.get(guild_id)
+        guild = self.bot.get_guild(guild_id)
+        vc = guild.voice_client if guild else None
+        if (not data or data.get("stopping") or expected_song is None
+                or data.get("current") is not expected_song or not vc or not vc.is_connected()):
+            return False
+        # Invalidate the voice callback BEFORE stop, otherwise it may skip a second song.
+        self._advance_voice_generation(guild_id)
+        for key in ("play_task", "preload_task"):
+            task = data.get(key)
+            if task and not task.done() and task is not asyncio.current_task():
+                task.cancel()
+        self._stop_progress_task(guild_id)
+        if vc.is_playing() or vc.is_paused():
+            vc.stop()
+        data["error_count"] = 0
+        self.play_next(guild_id)
+        await self.update_player_ui(guild_id)
+        return True
+
+    def enqueue_songs(self, guild_id: int, songs, *, position="end"):
+        """One synchronous enqueue/start transition shared by the panel and Agent."""
+        data = self._get_or_create_queue(guild_id)
+        guild = self.bot.get_guild(guild_id)
+        vc = guild.voice_client if guild else None
+        if data.get("stopping") or not vc or not vc.is_connected():
+            raise RuntimeError("语音连接不可用，请重新加入语音频道后点歌。")
+        if not is_voice_channel(vc.channel):
+            raise RuntimeError('音乐播放目标必须是语音频道。')
+        data['channel'] = vc.channel
+        if position not in {"end", "next"}:
+            raise ValueError("invalid queue position")
+        if not songs:
+            return {"added": 0, "rejected": 0, "started": False, "recovered": False}
+        recovered = bool(data.get("current")
+                         and (data.get("playback_failed") or data.get("agent_phase") == "error")
+                         and not (vc.is_playing() or vc.is_paused()))
+        if recovered:
+            self._advance_voice_generation(guild_id)
+            task = data.get("play_task")
+            if task and not task.done() and task is not asyncio.current_task():
+                task.cancel()
+            self._stop_progress_task(guild_id)
+            data["current"] = None
+            data["start_time"] = None
+            data["paused_elapsed"] = 0
+            data["error_count"] = 0
+            data["playback_failed"] = False
+        capacity = max(0, self.max_queue_length - len(data["queue"]) - bool(data.get("current")))
+        accepted = list(songs[:capacity])
+        if position == "next" and accepted:
+            data["queue"][0:0] = accepted
+            data["priority_next"] = accepted[0]
+        else:
+            data["queue"].extend(accepted)
+        started = bool(not data.get("current") and data["queue"])
+        if started:
+            data["error_count"] = 0
+            self.play_next(guild_id)
+        elif accepted:
+            self._spawn(self._preload_next(guild_id))
+        return {"added": len(accepted), "rejected": len(songs) - len(accepted),
+                "started": started, "recovered": recovered}
 
     # --- 批量 / 单曲添加 ---
 
@@ -1800,6 +2019,10 @@ class Music(commands.Cog):
         is_collection=False,
         collection_name="",
     ):
+        if not await BaseView.interaction_check(self, interaction):
+            return
+        if not songs:
+            return await interaction.followup.send("没有可添加的歌曲。", ephemeral=True)
         try:
             vc = await self._ensure_voice_client(interaction)
         except Exception as e:
@@ -1811,23 +2034,18 @@ class Music(commands.Cog):
                 "You are not in a voice channel.", ephemeral=True
             )
 
+        # Voice membership and the interaction origin can change while waiting
+        # for search/connection. Revalidate immediately before the enqueue.
+        if not await BaseView.interaction_check(self, interaction):
+            return
+
         guild_id = interaction.guild_id
         queue_data = self._get_or_create_queue(guild_id)
         queue_data["stopping"] = False
-        queue_data["channel"] = interaction.channel
-        if queue_data["message"] is None and interaction.message:
-            queue_data["message"] = interaction.message
+        queue_data["channel"] = vc.channel
 
-        added_count = 0
-        for song in songs:
-            if not queue_data["current"]:
-                queue_data["current"] = song
-                asyncio.create_task(self._play_music(interaction, song))
-            else:
-                queue_data["queue"].append(song)
-            added_count += 1
-            if added_count == 1 and len(queue_data["queue"]) > 0:
-                asyncio.create_task(self._preload_next(guild_id))
+        result = self.enqueue_songs(guild_id, songs)
+        added_count, rejected_count = result["added"], result["rejected"]
 
         await self.update_player_ui(guild_id)
 
@@ -1838,6 +2056,10 @@ class Music(commands.Cog):
         else:
             summary.append(f"✅ 已添加 **{added_count}** 首歌曲")
 
+        if rejected_count:
+            summary.append(f"队列上限为 {self.max_queue_length} 首，未加入 {rejected_count} 首。")
+        if result["recovered"]:
+            summary.append("已结束上一首的失败状态，恢复队列播放。")
         if not_found_list:
             summary.append(f"❌ 未找到: {', '.join(not_found_list)}")
 
@@ -1853,10 +2075,8 @@ class Music(commands.Cog):
     async def process_batch_request(
         self, interaction: discord.Interaction, queries: list
     ):
-        if not interaction.user.voice:
-            return await interaction.response.send_message(
-                "❌ 先进入语音频道", ephemeral=True
-            )
+        if not await BaseView.interaction_check(self, interaction):
+            return
 
         await interaction.response.defer(ephemeral=True)
 
@@ -1891,10 +2111,8 @@ class Music(commands.Cog):
     async def process_direct_link_request(
         self, interaction: discord.Interaction, urls: list[str]
     ):
-        if not interaction.user.voice:
-            return await interaction.response.send_message(
-                "❌ 需要先进入语音频道", ephemeral=True
-            )
+        if not await BaseView.interaction_check(self, interaction):
+            return
 
         await interaction.response.defer(ephemeral=True)
 
@@ -1924,10 +2142,8 @@ class Music(commands.Cog):
     async def process_collection_request(
         self, interaction: discord.Interaction, link: str, c_type: str
     ):
-        if not interaction.user.voice:
-            return await interaction.response.send_message(
-                "❌ 需要先进入语音频道", ephemeral=True
-            )
+        if not await BaseView.interaction_check(self, interaction):
+            return
 
         await interaction.response.defer(ephemeral=True)
 
@@ -1987,22 +2203,23 @@ class Music(commands.Cog):
     # --- 快捷指令 ---
     @app_commands.command(name="听歌", description="音乐控制面板")
     async def panel(self, interaction: discord.Interaction):
-        if not interaction.user.voice:
-            await interaction.response.send_message(
-                "❌ 请先加入语音频道", ephemeral=True
-            )
+        if not await BaseView.interaction_check(self, interaction):
             return
 
         await interaction.response.defer(ephemeral=True)
 
         data = self._get_or_create_queue(interaction.guild_id)
-        data["channel"] = interaction.channel
 
         view = data["view"]
-        view.update_container()
         try:
-            await self._delete_panel_message(interaction.guild_id)
-            data["message"] = await interaction.channel.send(view=view)
+            async with data.setdefault("ui_lock", asyncio.Lock()):
+                if not await BaseView.interaction_check(self, interaction):
+                    return
+                target = interaction.user.voice.channel
+                data['channel'] = target
+                view.update_container()
+                await self._delete_panel_message(interaction.guild_id)
+                data["message"] = await self._send_player_panel(target, view)
             await interaction.followup.send("✅ 已在当前频道底部刷新面板", ephemeral=True)
         except Exception as e:
             print(f"❌ 发送面板失败: {e}")

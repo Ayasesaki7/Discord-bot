@@ -170,32 +170,37 @@ class ProjectToolHostTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("hot-load", str(result["content"]))
             self.assertIn("after", guidance.read_text(encoding="utf-8"))
 
-    async def test_live_draw_and_fortune_tool_folders_are_writable(self) -> None:
+    async def test_removed_fortune_tool_folder_is_not_writable(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            draw_file = root / "tools" / "draw" / "settings.py"
-            draw_file.parent.mkdir(parents=True)
-            draw_file.write_text("VALUE = 'before'\n", encoding="utf-8")
+            fortune_file = root / "tools" / "fortune" / "settings.py"
+            fortune_file.parent.mkdir(parents=True)
+            fortune_file.write_text("VALUE = 'before'\n", encoding="utf-8")
             host = ProjectToolHost(root)
 
-            await host.execute(
-                "edit",
-                {
-                    "file_path": "tools/draw/settings.py",
-                    "old_string": "before",
-                    "new_string": "after",
-                },
-            )
-            await host.execute(
-                "create",
-                {
-                    "file_path": "tools/fortune/new_rule.json",
-                    "content": '{"enabled": true}\n',
-                },
-            )
+            with self.assertRaises(ProjectToolError):
+                await host.execute(
+                    "edit",
+                    {"file_path": "tools/fortune/settings.py", "old_string": "before", "new_string": "after"},
+                )
+            with self.assertRaises(ProjectToolError):
+                await host.execute(
+                    "create",
+                    {"file_path": "tools/fortune/new_rule.json", "content": '{}\n'},
+                )
+            self.assertIn("before", fortune_file.read_text(encoding="utf-8"))
+            self.assertFalse((root / "tools" / "fortune" / "new_rule.json").exists())
 
-            self.assertIn("after", draw_file.read_text(encoding="utf-8"))
-            self.assertTrue((root / "tools" / "fortune" / "new_rule.json").is_file())
+    async def test_removed_draw_folder_cannot_be_recreated_by_maintenance(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            host = ProjectToolHost(root)
+            with self.assertRaises(ProjectToolError):
+                await host.execute(
+                    "create",
+                    {"file_path": "tools/draw/settings.json", "content": "{}"},
+                )
+            self.assertFalse((root / "tools" / "draw").exists())
 
     async def test_new_executable_tool_source_requires_owner_confirmation(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -239,15 +244,15 @@ class ProjectToolHostTests(unittest.IsolatedAsyncioTestCase):
     async def test_bounded_list_shows_structure_without_sensitive_directories(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            (root / "tools" / "draw").mkdir(parents=True)
-            (root / "tools" / "draw" / "agent.py").write_text("VALUE = 1\n", encoding="utf-8")
+            (root / "tools" / "agent").mkdir(parents=True)
+            (root / "tools" / "agent" / "agent.py").write_text("VALUE = 1\n", encoding="utf-8")
             (root / "node_modules" / "package").mkdir(parents=True)
             (root / "node_modules" / "package" / "secret.js").write_text("secret\n", encoding="utf-8")
             host = ProjectToolHost(root)
 
             result = await host.execute("list", {"directory": ".", "max_depth": 3})
 
-            self.assertIn("tools/draw/agent.py", str(result["content"]))
+            self.assertIn("tools/agent/agent.py", str(result["content"]))
             self.assertNotIn("node_modules", str(result["content"]))
 
 

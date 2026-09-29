@@ -42,3 +42,5 @@ agent_workspace/
 plugin_staging/
 config/credentials/*
 !config/credentials/README.md
+# Deployment-specific host addresses, usernames and private operational notes.
+deploy/PRODUCTION.md

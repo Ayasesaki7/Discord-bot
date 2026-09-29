@@ -4,8 +4,10 @@ import asyncio
 import json
 import unittest
 from types import SimpleNamespace
+import discord
 
 from chat.agent.music_tools import MusicToolError, MusicToolHost
+from music.cog import Music
 
 
 def song(name: str) -> dict[str, object]:
@@ -49,8 +51,14 @@ class FakeVoiceClient:
 
 
 class FakeMusic:
+    # Exercise the production enqueue transition with stubbed I/O.
+    enqueue_songs = Music.enqueue_songs
+    _advance_voice_generation = Music._advance_voice_generation
+
     def __init__(self, guild) -> None:
         self.guild = guild
+        self.bot = SimpleNamespace(get_guild=lambda _id: self.guild)
+        self.max_queue_length = 200
         self.queues: dict[int, dict[str, object]] = {}
         self.agent_locks: dict[int, asyncio.Lock] = {}
         self.progress_stopped = False
@@ -89,12 +97,21 @@ class FakeMusic:
         copied["requester"] = requester
         return copied
 
-    async def _ensure_voice_client_for(self, guild, member):
+    async def _ensure_voice_client_for(self, guild, member, *, expected_channel_id=None):
         guild.voice_client = FakeVoiceClient(member.voice.channel)
         return guild.voice_client
 
     async def _play_music_task(self, _guild_id: int, _song) -> None:
         return None
+
+    def _spawn(self, coroutine):
+        return asyncio.create_task(coroutine)
+
+    def play_next(self, guild_id):
+        data = self.queues[guild_id]
+        data['current'] = data['queue'].pop(0) if data['queue'] else None
+        data['agent_phase'] = 'loading' if data['current'] else 'idle'
+        data['playback_failed'] = False
 
     async def _preload_next(self, _guild_id: int) -> None:
         return None
@@ -126,7 +143,7 @@ class FakeBot:
 
 class MusicToolHostTests(unittest.IsolatedAsyncioTestCase):
     def make_host(self, *, user_channel=True, bot_channel=None):
-        voice_channel = SimpleNamespace(id=10, name="Music")
+        voice_channel = SimpleNamespace(id=10, name="Music", type=discord.ChannelType.voice)
         requester_channel = voice_channel if user_channel else None
         author = SimpleNamespace(
             id=20,
@@ -144,7 +161,7 @@ class MusicToolHostTests(unittest.IsolatedAsyncioTestCase):
         message = SimpleNamespace(
             guild=guild,
             author=author,
-            channel=SimpleNamespace(id=40),
+            channel=voice_channel,
         )
         return MusicToolHost(bot=FakeBot(music), message=message), music, guild
 
@@ -227,6 +244,40 @@ class MusicToolHostTests(unittest.IsolatedAsyncioTestCase):
                 "add",
                 {"query": "Song", "guild_id": "999", "voice_channel_id": "888"},
             )
+
+    async def test_agent_add_recovers_failed_current_and_starts_new_track(self):
+        host, music, guild = self.make_host()
+        data = music._get_or_create_queue(guild.id)
+        data.update(current=song('Failed'), agent_phase='error', playback_failed=True, error_count=3)
+        guild.voice_client = FakeVoiceClient(host.message.author.voice.channel)
+        result = await host.execute('add', {'query': 'New'})
+        self.assertEqual(data['current']['name'], 'New')
+        self.assertEqual(data['agent_phase'], 'loading')
+        self.assertEqual(data['error_count'], 0)
+        self.assertIn('playback resumed', result['summary'])
+
+    async def test_agent_search_failure_does_not_overwrite_playback_failure_state(self):
+        host, music, guild = self.make_host()
+        data = music._get_or_create_queue(guild.id)
+        data.update(current=song('Failed'), agent_phase='error', playback_failed=True)
+        guild.voice_client = FakeVoiceClient(host.message.author.voice.channel)
+        with self.assertRaises(MusicToolError):
+            await host.execute('add', {'query': 'missing'})
+        self.assertEqual(data['agent_phase'], 'error')
+        self.assertTrue(data['playback_failed'])
+        await host.execute('add', {'query': 'New'})
+        self.assertEqual(data['current']['name'], 'New')
+
+    async def test_agent_cannot_enqueue_after_leaving_voice_while_searching(self):
+        host, music, guild = self.make_host()
+        guild.voice_client = FakeVoiceClient(host.message.author.voice.channel)
+        def search(query):
+            host.message.author.voice = None
+            return song(query)
+        music._search_song = search
+        with self.assertRaisesRegex(MusicToolError, 'join a voice channel'):
+            await host.execute('add', {'query': 'New'})
+        self.assertIsNone(music.queues[guild.id]['current'])
 
 
 if __name__ == "__main__":

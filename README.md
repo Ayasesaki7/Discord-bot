@@ -1,6 +1,6 @@
 # ATRI Discord Bot
 
-一个以 Discord 为运行入口的多功能 Bot，包含音乐播放、AI 聊天、DSH 持久会话、图片生成、Bilibili/抖音解析、运势、身份组领取、黑名单与管理工具。
+一个以 Discord 为运行入口的多功能 Bot，包含音乐播放、AI 聊天、DSH 持久会话、Bilibili/抖音解析、语音、服务器管理、消息转发、记忆和管理工具。
 
 > 本仓库只包含可公开的源码和示例配置。Token、Cookie、Discord 用户/服务器/频道/身份组 ID、聊天记录、日志和运行时数据库都应只保存在部署机器上。
 
@@ -55,6 +55,8 @@ ATRI_CHAT_GUILD_WHITELIST_IDS=允许聊天的服务器ID
 ```
 
 多个服务器 ID 使用英文逗号分隔。其他配置项的用途和默认值见 [.env.example](.env.example)。QQ 音乐、Bilibili 和抖音 Cookie 建议分别放在 `config/credentials/` 下；该目录除说明文件外不会被 Git 跟踪。
+
+服务器管理、处罚、身份组领取和记忆功能使用的服务器、频道、身份组 ID 也必须写在本机 `.env` 中。不要把生产服务器地址、SSH 信息或运维笔记提交到仓库；`deploy/PRODUCTION.md` 是本机部署记录，默认被忽略。
 
 ## 3. 安装并启动
 
@@ -138,6 +140,16 @@ ATRI_AGENT_V2_OWNER_ONLY=false
 
 DSH 默认复用 `OPENAI_BASE_URL`、`OPENAI_API_KEY` 和 `OPENAI_MODEL`。独立的维护 Agent 可另外启用 `ATRI_AGENT_CODE_ENABLED`，并通过 Discord 的 `/开发agent设置` 配置专用 API。更详细的架构和安全边界见 [agent_runtime/dsh/README.md](agent_runtime/dsh/README.md)。
 
+## 5. 可选功能配置
+
+### 服务器处罚和身份组
+
+处罚命令只有在设置 `PUNISHMENT_GUILD_ID` 后才会加载；公示频道使用 `PUNISHMENT_ANNOUNCE_CHANNEL_ID`。身份组领取面板使用 `ROLE_CLAIM_GUILD_ID`、`ROLE_CLAIM_MANAGER_ROLE_ID` 和 JSON 格式的 `ROLE_CLAIM_OPTIONS_JSON`。这些值不提供公开默认值，请从目标服务器复制真实 ID 写入本机 `.env`。
+
+### 音乐自定义表情
+
+`MUSIC_PAUSE_EMOJI`、`MUSIC_PROGRESS_FILL_EMOJI`、`MUSIC_PROGRESS_KNOB_EMOJI` 和 `MUSIC_ADD_EMOJI` 可以填写当前应用可用的自定义表情标记；留空时使用通用 Unicode 表情。聊天任务确认表情同样通过 `ATRI_TASK_EMOJI_DANGJI`、`ATRI_TASK_EMOJI_MIAOMIAO`、`ATRI_TASK_EMOJI_DIE` 和 `ATRI_TASK_EMOJI_MAOZHUA` 配置。
+
 ## 如何更换 Discord 主人 ID
 
 这里需要填写的是你的 Discord **用户 ID**，不是用户名、服务器 ID，也不是 Bot 应用 ID。
@@ -179,6 +191,7 @@ Linux：
 - `agent_runtime/dsh/` 中会上传的是运行代码、配置模板和锁文件；不会上传 `node_modules` 或实际聊天会话。
 - 保持 `ATRI_CHAT_LOG_SENSITIVE_CONTENT=false`，错误日志只记录必要的脱敏元数据。
 - 不建议把 `ATRI_AGENT_SESSION_ROOT` 指向仓库内部；Linux 请使用 `/var/lib/...`、`/srv/...` 或用户数据目录。
+- DSH 会话是持久 JSONL 数据，包含模型上下文和工具结果；部署时应限制目录权限，迁移或备份时也要按私密数据处理。
 
 提交前可以检查：
 

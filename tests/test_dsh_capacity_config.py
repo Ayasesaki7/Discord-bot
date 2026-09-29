@@ -20,6 +20,7 @@ class DshCapacityConfigTests(unittest.TestCase):
             config,
         )
         self.assertNotIn('retainRatio:', config)
+        self.assertIn("name: './plugins/atri-compaction/index.js'", config)
         self.assertNotIn(
             'contextWindow: !!js Number(process.env.ATRI_DSH_CONTEXT_WINDOW',
             config,

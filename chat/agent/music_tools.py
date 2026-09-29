@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from music.access import in_voice_chat
 
 
 _MAX_AGENT_QUEUE_LENGTH = 200
@@ -109,13 +110,14 @@ class MusicToolHost:
             position = str(arguments.get("position") or "end").strip().casefold()
             if position not in {"end", "next"}:
                 raise MusicToolError("position must be end or next")
-            total_items = len(queue_data["queue"]) + bool(queue_data.get("current"))
+            failed = queue_data.get("playback_failed") or queue_data.get("agent_phase") == "error"
+            total_items = len(queue_data["queue"]) + bool(queue_data.get("current") and not failed)
             if total_items >= _MAX_AGENT_QUEUE_LENGTH:
                 raise MusicToolError(
                     f"the Agent music queue is capped at {_MAX_AGENT_QUEUE_LENGTH} tracks"
                 )
-            queue_data["agent_phase"] = "searching"
-            queue_data["agent_last_error"] = None
+            # Searching for another song must not overwrite the active track's
+            # failure/loading state; enqueue_songs needs it to recover playback.
             direct_url = music._normalize_direct_audio_url(query)
             if direct_url:
                 song = music._direct_audio_song(
@@ -130,16 +132,17 @@ class MusicToolHost:
                         self.message.author.display_name,
                     )
             if not song:
-                queue_data["agent_phase"] = "error"
-                queue_data["agent_last_error"] = "song not found"
                 raise MusicToolError(f"no song was found for: {query}")
 
+            # Do not connect to a different voice if the user moved during search.
+            _requester_channel, voice_client = self._require_same_voice(music, guild)
             if voice_client is None or not voice_client.is_connected():
                 queue_data["agent_phase"] = "connecting"
                 try:
                     voice_client = await music._ensure_voice_client_for(
                         guild,
                         self.message.author,
+                        expected_channel_id=_requester_channel.id,
                     )
                 except Exception as exc:
                     queue_data["agent_phase"] = "error"
@@ -150,22 +153,17 @@ class MusicToolHost:
                 queue_data["agent_last_error"] = "voice connection unavailable"
                 raise MusicToolError("voice connection is unavailable")
 
-            queue_data["channel"] = self.message.channel
+            # Search may take seconds: revalidate voice membership at mutation time.
+            self._require_same_voice(music, guild)
+            queue_data["channel"] = voice_client.channel
             queue_data["stopping"] = False
-            if not queue_data.get("current"):
-                queue_data["current"] = song
-                queue_data["agent_phase"] = "loading"
-                asyncio.create_task(music._play_music_task(guild.id, song))
-                disposition = "starting now"
-            else:
-                if position == "next":
-                    queue_data["queue"].insert(0, song)
-                    queue_data["priority_next"] = song
-                    disposition = "queued next"
-                else:
-                    queue_data["queue"].append(song)
-                    disposition = "added to the queue"
-                asyncio.create_task(music._preload_next(guild.id))
+            result = music.enqueue_songs(guild.id, [song], position=position)
+            if not result["added"]:
+                raise MusicToolError("music queue is full")
+            disposition = "starting now" if queue_data.get("current") is song else (
+                "queued next" if position == "next" else "added to the queue")
+            if result["recovered"]:
+                disposition += "; playback resumed after the previous failure"
             await music.update_player_ui(guild.id)
             return f"{self._song_label(song)} was {disposition}."
 
@@ -192,12 +190,8 @@ class MusicToolHost:
             return "Resumed the current track."
 
         if action == "skip":
-            if voice_client is None or not (
-                voice_client.is_playing() or voice_client.is_paused()
-            ):
-                raise MusicToolError("skip is allowed only while a track is active")
-            queue_data["agent_phase"] = "loading" if queue_data["queue"] else "idle"
-            voice_client.stop()
+            if not await music.skip_current(guild.id, queue_data.get("current")):
+                raise MusicToolError("skip requires a current track and a connected voice channel")
             return "Skipped the current track."
 
         if action == "stop":
@@ -256,6 +250,8 @@ class MusicToolHost:
             raise MusicToolError(
                 "the requester must join the same voice channel as the bot"
             )
+        if not in_voice_chat(getattr(self.message, 'channel', None), requester_channel):
+            raise MusicToolError('请在你当前加入的语音频道的文字聊天区点歌或控制播放；普通文字频道不能操作音乐。')
         return requester_channel, voice_client
 
     def _snapshot(self, music, guild) -> dict[str, object]:
@@ -274,6 +270,7 @@ class MusicToolHost:
                 queue_data,
                 requester_voice=requester_voice,
                 bot_voice=bot_voice,
+                in_voice_chat=in_voice_chat(getattr(self.message, 'channel', None), requester_voice),
             ),
             "voiceChannel": (
                 {"id": str(bot_voice.id), "name": str(bot_voice.name)}
@@ -324,12 +321,13 @@ class MusicToolHost:
         *,
         requester_voice,
         bot_voice,
+        in_voice_chat: bool,
     ) -> list[str]:
         actions = ["status", "queue"]
         same_voice = requester_voice is not None and (
             bot_voice is None or requester_voice == bot_voice
         )
-        if not same_voice:
+        if not same_voice or not in_voice_chat:
             return actions
         actions.extend(["add", "set_mode"])
         pending = list((queue_data or {}).get("queue", []))
@@ -343,6 +341,8 @@ class MusicToolHost:
             (queue_data or {}).get("current") or pending or bot_voice is not None
         ):
             actions.append("stop")
+            if (queue_data or {}).get("current") and bot_voice is not None:
+                actions.append("skip")
         return actions
 
     def _record_transition(

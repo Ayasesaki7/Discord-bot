@@ -24,7 +24,6 @@ from chat.cog import (
     _DiscordStreamSession,
 )
 from chat.client import ChatCompletionUsage
-from chat.draw.agent import AtriDrawAgent, DrawHandleResult
 from chat.task_lifecycle import ChannelMessageQueue, ChatTaskLifecycle, format_todo_stage
 
 
@@ -141,9 +140,9 @@ class ChatTaskLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(message.status_messages, [])
 
         await lifecycle.set_stage("正在整理画面需求…")
-        await lifecycle.set_stage("正在调用 NAI…")
+        await lifecycle.set_stage("正在查询歌曲…")
         status = message.status_messages[0]
-        self.assertEqual(status.content, "-# 正在调用 NAI…")
+        self.assertEqual(status.content, "-# 正在查询歌曲…")
 
         await lifecycle.finish(success=True)
 
@@ -332,27 +331,6 @@ class DiscordStreamSessionTests(unittest.IsolatedAsyncioTestCase):
         await stream.fail("安全错误提示")
 
         self.assertEqual([message.content for message in created], ["安全错误提示"])
-
-
-class DrawPresentationSafetyTests(unittest.TestCase):
-    def test_certificate_failure_is_explained_without_echoing_upstream_error(self) -> None:
-        raw_error = (
-            "Cannot connect to host private.example:443 ssl:True "
-            "[SSLCertVerificationError: certificate has expired]"
-        )
-
-        message = AtriDrawAgent._safe_draw_failure_text(  # type: ignore[arg-type]
-            None,
-            RuntimeError(raw_error),
-        )
-
-        self.assertIn("证书校验失败", message)
-        self.assertNotIn("private.example", message)
-        self.assertNotIn("SSLCertVerificationError", message)
-
-    def test_draw_handle_result_separates_routing_from_success(self) -> None:
-        self.assertTrue(DrawHandleResult(handled=True, succeeded=False))
-        self.assertFalse(DrawHandleResult(handled=False))
 
 
 class TaskReactionResolutionTests(unittest.TestCase):
@@ -1951,7 +1929,7 @@ class MaintenanceContextIsolationTests(unittest.TestCase):
     def test_only_compact_report_crosses_back_to_normal_chat(self) -> None:
         cog = object.__new__(AtriChat)
         raw_report = (
-            "Changed tools/draw/agent.py\n"
+            "Changed tools/agent/service.py\n"
             "```python\n"
             "PRIVATE_SOURCE = 'must not enter chat context'\n"
             "```\n"
@@ -1960,7 +1938,7 @@ class MaintenanceContextIsolationTests(unittest.TestCase):
 
         summary = cog._maintenance_public_summary(raw_report)
 
-        self.assertIn("Changed tools/draw/agent.py", summary)
+        self.assertIn("Changed tools/agent/service.py", summary)
         self.assertIn("Checks passed", summary)
         self.assertNotIn("PRIVATE_SOURCE", summary)
 
@@ -1992,9 +1970,10 @@ class CapabilityManifestTests(unittest.IsolatedAsyncioTestCase):
         cog.agent_code_enabled = True
         manifest = cog._build_capability_prompt()
 
-        self.assertIn("draw_image", manifest)
-        self.assertIn("daily_fortune", manifest)
-        self.assertIn("draw_profile", manifest)
+        self.assertNotIn("draw_image", manifest)
+        self.assertNotIn("daily_fortune", manifest)
+        self.assertNotIn("draw_profile", manifest)
+        self.assertIn("Image generation is currently unavailable", manifest)
         self.assertIn("PDF reading", manifest)
         self.assertIn("discord_manage", manifest)
         self.assertIn("web_search", manifest)

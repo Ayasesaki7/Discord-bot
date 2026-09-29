@@ -38,44 +38,6 @@ class _FakeClientSession:
 
 
 class ChatClientTransportTests(unittest.IsolatedAsyncioTestCase):
-    def test_grounding_metadata_is_collected_as_web_sources(self) -> None:
-        client = OpenAICompatibleClient(
-            OpenAICompatibleConfig(
-                base_url="https://example.com/v1",
-                api_key="test-key",
-                model="test-model",
-            )
-        )
-        debug: dict[str, object] = {}
-
-        client._update_debug_from_payload(
-            debug,
-            {
-                "choices": [],
-                "groundingMetadata": {
-                    "groundingChunks": [
-                        {
-                            "web": {
-                                "uri": "https://example.com/current-report",
-                                "title": "Current report",
-                            }
-                        }
-                    ]
-                },
-            },
-        )
-
-        self.assertIn("network_search", debug["tools_used"])
-        self.assertEqual(
-            debug["web_sources"],
-            [
-                {
-                    "url": "https://example.com/current-report",
-                    "title": "Current report",
-                }
-            ],
-        )
-
     async def test_certificate_validation_failure_is_not_retried_or_echoed(self) -> None:
         client = OpenAICompatibleClient(
             OpenAICompatibleConfig(

@@ -13,15 +13,9 @@ import time
 from pathlib import Path
 
 from .project_tools import ProjectToolError
+from .log_reader import HistoricalLogReader
 
 
-_LOG_FILES = {
-    "bot": "bot.log",
-    "error": "bot.err.log",
-}
-_LOG_TAIL_DEFAULT_LINES = 160
-_LOG_TAIL_MAX_LINES = 500
-_LOG_READ_MAX_BYTES = 512 * 1024
 _COMMAND_OUTPUT_MAX_BYTES = 24 * 1024
 _COMMAND_TIMEOUT_SECONDS = 8.0
 _SECRET_PATTERNS = (
@@ -55,6 +49,7 @@ class RuntimeDiagnosticHost:
     def __init__(self, project_root: Path) -> None:
         self.project_root = project_root.resolve()
         self._started_monotonic = time.monotonic()
+        self._log_reader = HistoricalLogReader(self.project_root, self._redact_secrets)
 
     def system_info(self, arguments: dict[str, object]) -> dict[str, object]:
         self._reject_unknown(arguments, set())
@@ -84,35 +79,10 @@ class RuntimeDiagnosticHost:
         )
 
     def read_log(self, arguments: dict[str, object]) -> dict[str, object]:
-        self._reject_unknown(arguments, {"stream", "tail_lines"})
-        stream = str(arguments.get("stream") or "both").strip().casefold()
-        if stream not in {"bot", "error", "both"}:
-            raise RuntimeToolError("stream must be bot, error, or both")
-        tail_lines = arguments.get("tail_lines", _LOG_TAIL_DEFAULT_LINES)
-        if not isinstance(tail_lines, int) or isinstance(tail_lines, bool) or tail_lines <= 0:
-            raise RuntimeToolError("tail_lines must be a positive integer")
-        tail_lines = min(tail_lines, _LOG_TAIL_MAX_LINES)
-        selected = tuple(_LOG_FILES) if stream == "both" else (stream,)
-        sections: list[str] = []
-        any_truncated = False
-        for name in selected:
-            path = (self.project_root / _LOG_FILES[name]).resolve(strict=False)
-            try:
-                path.relative_to(self.project_root)
-            except ValueError as exc:  # pragma: no cover - fixed paths are defensive by design
-                raise RuntimeToolError("configured log path escaped the project") from exc
-            if not path.is_file():
-                sections.append(f"[{name}] log file does not exist.")
-                continue
-            lines, truncated = self._tail_file(path, tail_lines)
-            any_truncated = any_truncated or truncated
-            safe_lines = [self._redact_secrets(line)[:4000] for line in lines]
-            sections.append(f"[{name}]\n" + ("\n".join(safe_lines) or "(empty)"))
-        return self._result(
-            f"Read the fixed {stream} bot log tail (up to {tail_lines} lines per stream).",
-            "\n\n".join(sections),
-            truncated=any_truncated,
-        )
+        try:
+            return self._log_reader.read(arguments)
+        except ProjectToolError as exc:
+            raise RuntimeToolError(str(exc)) from None
 
     async def run_command(self, arguments: dict[str, object]) -> dict[str, object]:
         self._reject_unknown(arguments, {"command"})
@@ -275,24 +245,6 @@ class RuntimeDiagnosticHost:
         return saved.decode("utf-8", errors="replace"), truncated
 
     @staticmethod
-    def _tail_file(path: Path, line_count: int) -> tuple[list[str], bool]:
-        try:
-            with path.open("rb") as handle:
-                handle.seek(0, os.SEEK_END)
-                end = handle.tell()
-                start = max(0, end - _LOG_READ_MAX_BYTES)
-                handle.seek(start)
-                raw = handle.read(_LOG_READ_MAX_BYTES)
-        except OSError as exc:
-            raise RuntimeToolError("bot log could not be read") from exc
-        text = raw.decode("utf-8", errors="replace")
-        lines = text.splitlines()
-        if start > 0 and lines:
-            lines = lines[1:]
-        truncated = start > 0 or len(lines) > line_count
-        return lines[-line_count:], truncated
-
-    @staticmethod
     def _memory_snapshot() -> dict[str, object]:
         proc_meminfo = Path("/proc/meminfo")
         if proc_meminfo.is_file():
@@ -383,7 +335,10 @@ class RuntimeDiagnosticHost:
 
     @staticmethod
     def _redact_secrets(text: str) -> str:
-        result = text
+        # Header/JSON forms and prefixed configuration names must also be covered.
+        result = re.sub(r'(?i)\b(?:authorization|(?:set-)?cookie)\b[\"\x27]?\s*[:=].*', '[redacted-sensitive-header]', text)
+        result = re.sub(r'(?i)(\b(?:[\w-]*(?:api[_-]?key|password|secret)|(?:access|refresh|auth|discord|bot|session)[_-]token|token)[\"\x27]?\s*[:=]\s*)[\"\x27]?[^\s,;}\"\x27]{6,}',
+                        r'\1[redacted-secret]', result)
         for pattern in _SECRET_PATTERNS:
             if "prefix" in pattern.groupindex:
                 result = pattern.sub(lambda match: f"{match.group('prefix')}[redacted-secret]", result)

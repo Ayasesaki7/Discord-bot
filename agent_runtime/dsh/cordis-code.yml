@@ -1,7 +1,6 @@
 # ATRI's owner-only self-improvement runtime. Filesystem access is provided by
 # the local ATRI host plugin: non-sensitive project source is readable, while
-# writes are limited to config/agent and the tools/agent, tools/draw, and
-# tools/fortune capability folders.
+# writes are limited to config/agent and tools/agent.
 # No arbitrary shell, web, subagent, or Discord-send tool exists. Sequential
 # model/tool calls are allowed; only parallel tool execution is disabled.
 

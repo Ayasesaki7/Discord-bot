@@ -1,9 +1,12 @@
 # cogs/music/music_v.py
 import os
+from pathlib import Path
 
 import discord
 from discord import ui
 import random, time, math
+from .lyrics import lyric_window
+from .access import in_voice_chat, reject_interaction
 
 闲暇 = [
     "时光慢慢，心事懒懒",
@@ -16,16 +19,39 @@ PAUSE = os.getenv("MUSIC_PAUSE_EMOJI", "⏸️").strip() or "⏸️"
 FILL = os.getenv("MUSIC_PROGRESS_FILL_EMOJI", "▬").strip() or "▬"
 KNOB = os.getenv("MUSIC_PROGRESS_KNOB_EMOJI", "🔘").strip() or "🔘"
 ADD = os.getenv("MUSIC_ADD_EMOJI", "🎵").strip() or "🎵"
+DEFAULT_COVER_PATH = Path(__file__).with_name("assets") / "default-cover.png"
+DEFAULT_COVER_FILENAME = "atri-music-default.png"
+DEFAULT_COVER_URL = f"attachment://{DEFAULT_COVER_FILENAME}"
+
+
+def panel_text(value, limit=120):
+    """Keep externally supplied music metadata inside its own card field."""
+    text = " ".join(str(value or "未知").split())
+    return discord.utils.escape_markdown(discord.utils.escape_mentions(text[:limit]))
+
+
+def duration_text(milliseconds):
+    seconds = max(0, int((milliseconds or 0) / 1000))
+    hours, seconds = divmod(seconds, 3600)
+    minutes, seconds = divmod(seconds, 60)
+    return f"{hours}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes}:{seconds:02d}"
 
 
 class BaseView(ui.LayoutView):
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if getattr(interaction.client, 'is_globally_blacklisted', lambda _user_id: False)(interaction.user.id):
             return False
-        if not interaction.user.voice or not interaction.user.voice.channel:
-            await interaction.response.send_message(
-                "❌ 需要先进入语音频道才能进行操作！", ephemeral=True
-            )
+        if not interaction.guild or not getattr(getattr(interaction.user, "voice", None), "channel", None):
+            await reject_interaction(interaction, "❌ 需要先进入语音频道才能进行操作！")
+            return False
+        vc = interaction.guild.voice_client
+        if vc and vc.is_connected() and vc.channel != interaction.user.voice.channel:
+            await reject_interaction(interaction, "❌ 请加入 BOT 所在的语音频道后再操作。")
+            return False
+        if not in_voice_chat(getattr(interaction, 'channel', None), interaction.user.voice.channel):
+            await reject_interaction(interaction, "❌ 请在你当前加入的语音频道的文字聊天区使用音乐功能，普通文字频道不能点歌或控制播放。")
+            return False
+        if getattr(self, "guild_id", None) not in {None, interaction.guild_id}:
             return False
         return True
 
@@ -86,6 +112,9 @@ class SearchModal(ui.Modal, title="点歌台"):
         assert isinstance(self.mode_label.component, ui.Select)
         assert isinstance(self.query_label.component, ui.TextInput)
 
+        # A modal can remain open after its author moves/leaves voice.
+        if not await BaseView.interaction_check(self, interaction):
+            return
         search_type = self.mode_label.component.values[0]
         content = self.query_label.component.value
         lines = [line.strip() for line in content.split("\n") if line.strip()]
@@ -200,6 +229,9 @@ class SearchResultView(BaseView):
         if self.selected_index is None:
             return await interaction.response.defer()
 
+        if getattr(self, "_submitted", False):
+            return await interaction.response.send_message("这次选择已经提交。", ephemeral=True)
+        self._submitted = True
         song = self.candidates[self.selected_index]
         await interaction.response.defer()
         await self.cog.add_search_selection(interaction, song)
@@ -231,7 +263,7 @@ class QueueListView(BaseView):
         super().__init__(timeout=180)
         self.cog = cog
         self.guild_id = guild_id
-        self.queue = queue_data
+        self.queue = list(queue_data)  # Stable song identities, not mutable numeric positions.
         self.page = 0
         self.items_per_page = 25
         self.selected_index = None
@@ -259,8 +291,8 @@ class QueueListView(BaseView):
         for i, song in enumerate(current_items):
             abs_index = start + i
             prefix = "♥️" if abs_index == self.selected_index else f"{abs_index + 1}."
-            name = song["name"]
-            ar = (song.get("ar") or [{}])[0].get("name", "未知")
+            name = panel_text(song["name"]).replace("`", "'")
+            ar = panel_text((song.get("ar") or [{}])[0].get("name", "未知")).replace("`", "'")
             entry = f"{prefix} {name} - {ar}"
             clean_entry = entry[:35] + "..." if len(entry) > 35 else entry
             lines.append(clean_entry)
@@ -323,13 +355,16 @@ class QueueListView(BaseView):
         )
         btn_confirm.callback = self.on_confirm
 
-        inset_content = "\n-# 可选择歌曲插队"
+        btn_remove = ui.Button(label="移除所选", emoji="🗑️",
+                               style=discord.ButtonStyle.danger, disabled=confirm_disabled)
+        btn_remove.callback = self.on_remove
+        inset_content = "\n-# 可插队或移除待播歌曲；不会影响当前播放"
         container = ui.Container(
             ui.TextDisplay(content=f"### 📀 播放列表 - 共 {len(self.queue)} 首"),
             ui.TextDisplay(content=f"{list_content}{inset_content}"),
             ui.Separator(),
             ui.ActionRow(select_menu),
-            ui.ActionRow(btn_prev, btn_page, btn_next, btn_confirm),
+            ui.ActionRow(btn_prev, btn_page, btn_next, btn_confirm, btn_remove),
             accent_color=discord.Color.from_rgb(255, 95, 95),
         )
         self.add_item(container)
@@ -352,24 +387,101 @@ class QueueListView(BaseView):
         self._build_view()
         await interaction.response.edit_message(view=self)
 
+    async def on_remove(self, interaction: discord.Interaction):
+        if self.selected_index is None:
+            return await interaction.response.defer()
+        selected = self.queue[self.selected_index]
+        await interaction.response.defer()
+        removed = await self.cog.remove_pending_songs(self.guild_id, [selected])
+        self.queue = list(self.cog.queues.get(self.guild_id, {}).get("queue", []))
+        self.selected_index = None
+        self._build_view()
+        await interaction.edit_original_response(view=self)
+        await interaction.followup.send(
+            "已移除所选待播歌曲。" if removed else "歌曲已开始播放或不在队列中，未作更改。",
+            ephemeral=True,
+        )
+
     async def on_confirm(self, interaction: discord.Interaction):
         if self.selected_index is None:
             return await interaction.response.defer()
 
-        song_name = await self.cog.prioritize_song(interaction, self.selected_index)
+        selected_index = self.selected_index
+        selected_song = self.queue[selected_index]
+        await interaction.response.defer()
+        song_name = await self.cog.prioritize_song(
+            interaction, selected_index, expected_song=selected_song,
+        )
         if song_name:
             self.clear_items()
             res_container = ui.Container(
                 ui.TextDisplay(content="### ✅ 插队成功"),
-                ui.TextDisplay(content=f"已将 **{song_name}** 设为下一首播放。"),
+                ui.TextDisplay(content=f"已将 **{panel_text(song_name)}** 设为下一首播放。"),
                 accent_colour=discord.Color.blue(),
             )
             self.add_item(res_container)
-            await interaction.response.edit_message(view=self)
+            await interaction.edit_original_response(view=self)
         else:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "❌ 操作失败，队列可能已变更", ephemeral=True
             )
+
+
+class ClearQueueView(BaseView):
+    def __init__(self, cog, guild_id, user_id, songs):
+        super().__init__(timeout=60)
+        self.cog, self.guild_id, self.user_id = cog, guild_id, user_id
+        self.songs = list(songs)
+        self.submitted = False
+        confirm = ui.Button(label="确认清空待播", style=discord.ButtonStyle.danger)
+        cancel = ui.Button(label="保留队列", style=discord.ButtonStyle.secondary)
+        confirm.callback, cancel.callback = self.confirm, self.cancel
+        self.add_item(ui.Container(
+            ui.TextDisplay(content=f"### 清空这 {len(self.songs)} 首待播歌曲？"),
+            ui.TextDisplay(content="当前歌曲继续播放；打开此确认后新加入的歌曲会保留。"),
+            ui.ActionRow(confirm, cancel), accent_colour=discord.Color.orange(),
+        ))
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("请自己打开队列管理面板。", ephemeral=True)
+            return False
+        return await super().interaction_check(interaction)
+
+    async def confirm(self, interaction):
+        if self.submitted:
+            return await interaction.response.defer()
+        self.submitted = True
+        await interaction.response.defer()
+        count = await self.cog.remove_pending_songs(self.guild_id, self.songs)
+        await self.finish(interaction, f"已移除 {count} 首待播歌曲，当前播放不受影响。")
+
+    async def cancel(self, interaction):
+        if self.submitted:
+            return await interaction.response.defer()
+        self.submitted = True
+        await interaction.response.defer()
+        await self.finish(interaction, "已保留队列。")
+
+    async def finish(self, interaction, text):
+        self.clear_items()
+        self.add_item(ui.Container(ui.TextDisplay(content=text)))
+        await interaction.edit_original_response(view=self)
+        self.stop()
+
+
+class MusicOptionsView(BaseView):
+    def __init__(self, controls, guild_id):
+        super().__init__(timeout=120)
+        self.guild_id = guild_id
+        clear = ui.Button(label="清空待播", emoji="🗑️", style=discord.ButtonStyle.secondary)
+        refresh = ui.Button(label="刷新面板", emoji="🔄", style=discord.ButtonStyle.secondary)
+        clear.callback, refresh.callback = controls.callback_clear, controls.callback_refresh
+        self.add_item(ui.Container(
+            ui.TextDisplay(content="### 队列管理"),
+            ui.TextDisplay(content="清空待播会保留当前歌曲；主面板的停止键会清空队列并离开语音。"),
+            ui.ActionRow(clear, refresh),
+        ))
 
 
 class MusicInterface(BaseView):
@@ -409,31 +521,71 @@ class MusicInterface(BaseView):
             vc.pause()
             if cog:
                 cog._stop_progress_task(interaction.guild_id)
+                if queue_data:
+                    queue_data["agent_phase"] = "paused"
         elif vc and vc.is_paused():
             if queue_data:
                 queue_data["start_time"] = time.time()
             vc.resume()
             if cog:
                 cog._start_progress_task(interaction.guild_id)
+                if queue_data:
+                    queue_data["agent_phase"] = "playing"
         else:
             return await interaction.response.send_message("❌ 无播放", ephemeral=True)
 
-        self.update_container(interaction.guild_id)
-        await interaction.response.edit_message(view=self)
+        await interaction.response.defer()
+        if cog:
+            await cog.update_player_ui(interaction.guild_id)
 
     async def callback_skip(self, interaction: discord.Interaction):
+        cog = self.bot.get_cog("Music")
+        data = self.get_queue(interaction.guild_id) or {}
+        selected = self.current_song if self.guild_id else data.get("current")
+        await interaction.response.defer()
+        if not cog or not await cog.skip_current(interaction.guild_id, selected):
+            await interaction.followup.send("歌曲已切换，或语音未连接；请刷新面板。", ephemeral=True)
+
+    async def callback_clear(self, interaction: discord.Interaction):
+        cog = self.bot.get_cog("Music")
+        songs = (self.get_queue(interaction.guild_id) or {}).get("queue", [])
+        if not cog or not songs:
+            return await interaction.response.send_message("没有待播歌曲。", ephemeral=True)
+        await interaction.response.send_message(
+            view=ClearQueueView(cog, interaction.guild_id, interaction.user.id, songs), ephemeral=True,
+        )
+
+    async def callback_refresh(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+        cog = self.bot.get_cog("Music")
+        if cog:
+            await cog.update_player_ui(interaction.guild_id)
+
+    async def callback_more(self, interaction: discord.Interaction):
+        await interaction.response.send_message(view=MusicOptionsView(self, interaction.guild_id), ephemeral=True)
+
+    async def callback_lyrics(self, interaction: discord.Interaction):
+        cog = self.bot.get_cog("Music")
+        await interaction.response.defer()
+        if not cog:
+            return
+        data = cog._get_or_create_queue(interaction.guild_id)
+        data["lyrics_enabled"] = not data.get("lyrics_enabled", True)
+        task = data.get("lyrics_task")
+        if task and not task.done():
+            task.cancel()
+        if data["lyrics_enabled"] and data.get("current"):
+            cog._begin_lyrics(interaction.guild_id, data["current"])
         vc = interaction.guild.voice_client
-        if vc and (vc.is_playing() or vc.is_paused()):
-            vc.stop()
-            await interaction.response.defer()
-        else:
-            await interaction.response.send_message("❌ 未连接或未播放", ephemeral=True)
+        if vc and vc.is_playing():
+            cog._start_progress_task(interaction.guild_id)
+        await cog.update_player_ui(interaction.guild_id)
 
     async def callback_stop(self, interaction: discord.Interaction):
         cog = self.bot.get_cog("Music")
+        await interaction.response.defer()
         if cog:
             await cog.stop_handling(interaction.guild_id)
-        await interaction.response.defer()
 
     async def callback_mode(self, interaction: discord.Interaction):
         cog = self.bot.get_cog("Music")
@@ -442,9 +594,9 @@ class MusicInterface(BaseView):
                 "\u64ad\u653e\u5668\u6682\u65f6\u4e0d\u53ef\u7528", ephemeral=True
             )
 
+        await interaction.response.defer()
         cog.toggle_play_mode(interaction.guild_id)
-        self.update_container(interaction.guild_id)
-        await interaction.response.edit_message(view=self)
+        await cog.update_player_ui(interaction.guild_id)
 
     async def callback_add(self, interaction: discord.Interaction):
         cog = self.bot.get_cog("Music")
@@ -468,6 +620,10 @@ class MusicInterface(BaseView):
         queue_data = self.get_queue(guild_id)
         if not queue_data:
             return "- 正在准备播放\n> 时长未知"
+        if queue_data.get("agent_phase") == "loading":
+            return "-# 正在获取音频，可用 ⏭ 跳过"
+        if queue_data.get("agent_phase") == "error":
+            return "-# 本曲播放失败 · 重新点歌或 ⏭ 跳过"
 
         vc = (
             self.bot.get_guild(guild_id).voice_client
@@ -480,7 +636,7 @@ class MusicInterface(BaseView):
         paused_elapsed = queue_data.get("paused_elapsed", 0)
 
         if start_time:
-            elapsed_sec = paused_elapsed + (time.time() - start_time)
+            elapsed_sec = paused_elapsed + max(0, time.time() - start_time)
         else:
             elapsed_sec = paused_elapsed
 
@@ -490,159 +646,135 @@ class MusicInterface(BaseView):
 
         if not duration_ms or duration_ms <= 0:
             status = PAUSE if is_paused else KNOB
-            return f"- {status}\n> {fmt(elapsed_sec)} / --:--"
+            return f"{status}\n-# {fmt(elapsed_sec)} / --:--"
 
         total_sec = duration_ms / 1000
         elapsed_sec = min(elapsed_sec, total_sec)
         progress = elapsed_sec / total_sec if total_sec > 0 else 0
 
-        bar_len = 10
-        filled = int(progress * bar_len)
+        bar_len = 8
+        filled = min(bar_len - 1, int(progress * bar_len))
         bar = (
             PAUSE
             if is_paused
             else (FILL * filled + KNOB + FILL * (bar_len - filled - 1))
         )
 
-        return f"- {bar}\n> {fmt(elapsed_sec)} / {fmt(total_sec)}"
+        return f"{bar}\n-# {fmt(elapsed_sec)} / {fmt(total_sec)}"
+
+    def _lyric_text(self, data, current):
+        if not current or not data.get("lyrics_enabled", True):
+            return ""
+        lines = current.get("lyrics") or []
+        if not lines:
+            if current.get("lyrics_state") == "loading":
+                return "-# 正在获取歌词…"
+            if current.get("lyrics_state") in {"missing", "error"}:
+                return "-# 暂无可用逐句歌词"
+            return ""
+        elapsed = data.get("paused_elapsed", 0)
+        if data.get("start_time"):
+            elapsed += max(0, time.time() - data["start_time"])
+        previous, active, following = lyric_window(lines, elapsed)
+        rows = []
+        if previous:
+            rows.append(f"-# {panel_text(previous, 95)}")
+        rows.append(f"**{panel_text(active, 110)}**")
+        if following:
+            rows.append(f"-# {panel_text(following, 95)}")
+        return "\n".join(rows)
 
     def _build_container(self):
-        target_id = self.guild_id
-        title = "### \u97f3\u4e50\u7cfb\u7edf\u5df2\u542f\u52a8"
-        artist_content = "```md\n# \u7b49\u5f85\u6307\u4ee4...\n```"
-        cover_url = (
-            "https://raw.githubusercontent.com/atr1official/atri_official/main/%E6%97%B6%E5%A4%8F&%E6%A0%97%E5%8E%9F/ATRI_2.png"
-        )
-        progress_str = "\u70b9\u51fb\u6309\u94ae\u5f00\u59cb\u70b9\u6b4c"
-        queue_text = "- \u6ca1\u6709\u66f4\u591a\u6b4c\u66f2"
-        footer_text = "\u7b49\u5f85\u70b9\u6b4c..."
-        is_paused = False
-        play_mode = "sequential"
+        data = self.get_queue(self.guild_id) or {}
+        current, pending = data.get("current"), data.get("queue", [])
+        self.current_song = current
+        guild = self.bot.get_guild(self.guild_id) if self.guild_id else None
+        vc = guild.voice_client if guild else None
+        connected = bool(vc and vc.is_connected())
+        playing, paused = bool(vc and vc.is_playing()), bool(vc and vc.is_paused())
+        phase = "paused" if paused else "playing" if playing else data.get("agent_phase", "idle")
+        if not connected and current:
+            phase = "disconnected"
+        status, color = {
+            "playing": ("正在播放", 0xB0C6C1),
+            "paused": ("已暂停", 0xD5C5A1),
+            "loading": ("正在加载", 0xAFBDD3),
+            "error": ("播放遇到问题", 0xD9ADA2),
+            "stopping": ("正在停止", 0xB6B7BD),
+            "disconnected": ("语音已断开", 0xB6B7BD),
+        }.get(phase, ("音乐时光", 0xDBC0CB))
+        cover = DEFAULT_COVER_URL
+        if current:
+            metadata = f"### {panel_text(current.get('name'), 100)}"
+            artist = panel_text(" / ".join(str(item.get("name", "未知")) for item in (current.get("ar") or [{}])), 100)
+            metadata += f"\n{artist}"
+            album = (current.get("al") or {}).get("name")
+            if album and album != "未知":
+                metadata += f"\n-# {panel_text(album, 70)}"
+            picture = (current.get("al") or {}).get("picUrl")
+            if isinstance(picture, str) and picture.startswith(("https://", "http://")) and len(picture) < 1800:
+                cover = picture
+            progress = self._build_progress_bar(self.guild_id, current.get("dt", 0))
+            if not connected:
+                progress = "-# 语音已断开 · 重新点歌可连接"
+        else:
+            metadata = "### 今天想听什么？\n-# 歌名、歌单、专辑，或音频链接"
+            progress = ""
+        self.uses_default_cover = cover == DEFAULT_COVER_URL
 
-        if target_id:
-            queue_data = self.get_queue(target_id)
-            guild = self.bot.get_guild(target_id)
-            vc = guild.voice_client if guild else None
-            is_paused = vc.is_paused() if vc else False
+        mode = data.get("play_mode", "sequential")
+        cog = self.bot.get_cog("Music")
+        next_song = cog._preview_next_song(self.guild_id) if pending and cog else None
+        queue_line = ""
+        if next_song:
+            queue_line = f"-# 下一首 · {panel_text(next_song.get('name'), 65)}"
+        durations = [item.get("dt") or 0 for item in pending]
+        total = sum(max(0, value) for value in durations)
+        estimate = duration_text(total) if total else "时长未知"
+        if total and any(value <= 0 for value in durations):
+            estimate = "至少 " + estimate
+        footer = f"{'随机播放' if mode == 'shuffle' else '顺序播放'} · 待播 {len(pending)} 首"
+        if pending:
+            footer += f" · {estimate}"
 
-            if queue_data:
-                play_mode = queue_data.get("play_mode", "sequential")
-
-            if not queue_data or not queue_data.get("current"):
-                title = random.choice(["> 慢慢听", "> 放空一下", "> 跟着音乐飘", "> 信号不足，心情正好"])
-                artist_content = (
-                    "```md\n# \u97f3\u6e90\u81ea QQ \u97f3\u4e50\n"
-                    "> \u5f53\u524d\u4f7f\u7528\u514d\u767b\u5f55\u9002\u914d\n```"
-                )
-            else:
-                current = queue_data["current"]
-                title = f"### \U0001F3B5 {current['name']}"
-                ar = (current.get("ar") or [{}])[0].get("name", "\u672a\u77e5")
-                al = (current.get("al") or {}).get("name", "\u672a\u77e5")
-                artist_content = (
-                    f"```py\n'\u6b4c\u624b:' # {ar}\n'\u4e13\u8f91:' # {al[:15]}\n```"
-                )
-
-                pic = (current.get("al") or {}).get("picUrl")
-                if pic:
-                    cover_url = f"{pic}?param=300y300"
-
-                progress_str = self._build_progress_bar(target_id, current.get("dt", 0))
-
-                next_len = len(queue_data["queue"])
-                if next_len > 0:
-                    priority_song = queue_data.get("priority_next")
-                    next_song = None
-                    if priority_song is not None:
-                        for queued_song in queue_data["queue"]:
-                            if queued_song is priority_song:
-                                next_song = queued_song
-                                break
-
-                    if next_song is None and (play_mode == "sequential" or next_len == 1):
-                        next_song = queue_data["queue"][0]
-
-                    if next_song is not None:
-                        s_name = next_song["name"]
-                        s_ar = (next_song.get("ar") or [{}])[0].get("name", "\u672a\u77e5")
-                        queue_text = f"- \u5171 `{next_len}` \u9996\n> **NEXT >** {s_name} - {s_ar}"
-                    else:
-                        queue_text = (
-                            f"- \u5171 `{next_len}` \u9996\n"
-                            "> **SHUFFLE >** \u4e0b\u4e00\u9996\u5c06\u4ece\u961f\u5217\u4e2d\u968f\u673a\u62bd\u53d6"
-                        )
-                else:
-                    queue_text = "- \u6ca1\u6709\u66f4\u591a\u6b4c\u66f2"
-
-                footer_text = f"\u7531 {current.get('requester')} \u70b9\u6b4c"
-
-        mode_text = "\u968f\u673a\u64ad\u653e" if play_mode == "shuffle" else "\u987a\u5e8f\u64ad\u653e"
-        footer_text = f"{footer_text} | \u5f53\u524d\u6a21\u5f0f: {mode_text}" if footer_text else f"\u5f53\u524d\u6a21\u5f0f: {mode_text}"
-
-        btn_list = ui.Button(
-            emoji="\U0001F4C0", style=discord.ButtonStyle.primary, custom_id="music:list"
-        )
-        btn_list.callback = self.callback_list
-
-        btn_pause = ui.Button(
-            emoji="\u25B6\uFE0F" if is_paused else "\u23F8\uFE0F",
-            style=(
-                discord.ButtonStyle.success
-                if is_paused
-                else discord.ButtonStyle.secondary
-            ),
-            custom_id="music:pause",
-        )
-        btn_pause.callback = self.callback_pause
-
-        btn_skip = ui.Button(
-            emoji="\u23ED\uFE0F", style=discord.ButtonStyle.secondary, custom_id="music:skip"
-        )
-        btn_skip.callback = self.callback_skip
-
-        btn_mode = ui.Button(
-            label="\u968f\u673a" if play_mode == "shuffle" else "\u987a\u5e8f",
-            emoji="\U0001F500",
-            style=(
-                discord.ButtonStyle.success
-                if play_mode == "shuffle"
-                else discord.ButtonStyle.secondary
-            ),
-            custom_id="music:mode",
-        )
-        btn_mode.callback = self.callback_mode
-
-        btn_stop = ui.Button(
-            emoji="\u23F9\uFE0F", style=discord.ButtonStyle.danger, custom_id="music:stop"
-        )
-        btn_stop.callback = self.callback_stop
-
-        btn_add = ui.Button(
-            label="\u70b9\u6b4c",
-            emoji=ADD,
-            style=discord.ButtonStyle.success,
-            custom_id="music:add",
-        )
+        btn_add = ui.Button(label="点歌", emoji=ADD, style=discord.ButtonStyle.primary, custom_id="music:add")
         btn_add.callback = self.callback_add
+        btn_pause = ui.Button(emoji="▶️" if paused else "⏸️", style=discord.ButtonStyle.secondary,
+                              custom_id="music:pause", disabled=not (playing or paused))
+        btn_pause.callback = self.callback_pause
+        btn_skip = ui.Button(emoji="⏭️", style=discord.ButtonStyle.secondary,
+                             custom_id="music:skip", disabled=not (current and connected))
+        btn_skip.callback = self.callback_skip
+        btn_mode = ui.Button(emoji="🔀" if mode == "shuffle" else "➡️", style=discord.ButtonStyle.secondary,
+                             custom_id="music:mode")
+        btn_mode.callback = self.callback_mode
+        btn_stop = ui.Button(emoji="⏹️", style=discord.ButtonStyle.secondary,
+                             custom_id="music:stop", disabled=not (current or pending or connected))
+        btn_stop.callback = self.callback_stop
+        btn_list = ui.Button(label=f"队列 · {len(pending)}", style=discord.ButtonStyle.secondary, custom_id="music:list")
+        btn_list.callback = self.callback_list
+        btn_lyrics = ui.Button(label="歌词 · 开" if data.get("lyrics_enabled", True) else "歌词 · 关",
+                               style=discord.ButtonStyle.secondary, custom_id="music:lyrics")
+        btn_lyrics.callback = self.callback_lyrics
+        btn_more = ui.Button(label="更多", style=discord.ButtonStyle.secondary, custom_id="music:more")
+        btn_more.callback = self.callback_more
 
-        container = ui.Container(
-            ui.TextDisplay(content=title),
-            ui.Section(
-                ui.TextDisplay(content=artist_content),
-                accessory=ui.Thumbnail(media=cover_url),
-            ),
-            ui.Section(
-                ui.TextDisplay(content=progress_str),
-                accessory=btn_add,
-            ),
-            ui.Separator(),
-            ui.ActionRow(btn_list, btn_pause, btn_skip, btn_mode, btn_stop),
-            ui.Separator(),
-            ui.TextDisplay(content=queue_text),
-            ui.TextDisplay(content=f"-# {footer_text}" if footer_text else ""),
-            accent_color=discord.Color.from_rgb(255, 95, 95),
-        )
-
+        contents = [ui.TextDisplay(content=f"-# {status}")]
+        if cover:
+            contents.append(ui.Section(ui.TextDisplay(content=metadata), accessory=ui.Thumbnail(media=cover)))
+        else:
+            contents.append(ui.TextDisplay(content=metadata))
+        if progress:
+            contents.append(ui.TextDisplay(content=progress))
+        lyrics = self._lyric_text(data, current)
+        if lyrics:
+            contents.extend([ui.Separator(spacing=discord.SeparatorSpacing.small), ui.TextDisplay(content=lyrics)])
+        contents.extend([
+            ui.ActionRow(btn_add, btn_pause, btn_skip, btn_mode, btn_stop),
+            ui.ActionRow(btn_list, btn_lyrics, btn_more),
+        ])
+        if queue_line:
+            contents.append(ui.TextDisplay(content=queue_line))
+        contents.append(ui.TextDisplay(content=f"-# {footer}"))
         self.clear_items()
-        self.add_item(container)
-
+        self.add_item(ui.Container(*contents, accent_colour=discord.Color(color)))

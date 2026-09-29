@@ -268,7 +268,7 @@ class ChatWhitelistView(discord.ui.View):
         self.guild = guild
         self.candidate_page = 0
         self.whitelist_page = 0
-        self.status_message = '服务器白名单只影响聊天回复，不影响每日运势和其他功能。'
+        self.status_message = '服务器白名单只影响聊天回复，不影响音乐和其他功能。'
         self.error_message: str | None = None
         self.panel_message: discord.InteractionMessage | None = None
         self.closed = False
@@ -467,7 +467,7 @@ class ChatWhitelistView(discord.ui.View):
         else:
             description = (
                 '仅开发者可用。这里的白名单只控制聊天功能是否允许调用 AI；'
-                '每日运势、音乐和其他功能都不会被这份名单拦截。'
+                '音乐和其他功能都不会被这份名单拦截。'
             )
 
         embed = discord.Embed(

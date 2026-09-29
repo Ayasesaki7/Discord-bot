@@ -1,7 +1,5 @@
 # Capability tools
 
-- `draw/`: the live NovelAI drawing capability.
-- `fortune/`: the live daily-fortune capability.
 - `agent/`: staging area for new owner-reviewed Agent tools.
 - `lux/`: external downloader binary data; not Agent-readable or writable.
 

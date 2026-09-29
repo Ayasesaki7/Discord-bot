@@ -45,7 +45,7 @@ class DiscordAgentSemanticToolsTests(unittest.IsolatedAsyncioTestCase):
         )
 
         confirmation.assert_awaited_once()
-        channel.fetch_message.assert_not_awaited()
+        channel.fetch_message.assert_awaited_once_with(300)
         kwargs = channel.purge.await_args.kwargs
         self.assertEqual(kwargs["after"].id, 300)
         self.assertNotIn("before", kwargs)

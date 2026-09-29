@@ -79,9 +79,9 @@ def _read_owner_discord_id() -> int:
         return DEFAULT_OWNER_DISCORD_ID
     try:
         owner_id = int(raw)
-        return owner_id if owner_id > 0 else DEFAULT_OWNER_DISCORD_ID
     except ValueError:
         return DEFAULT_OWNER_DISCORD_ID
+    return owner_id if owner_id > 0 else DEFAULT_OWNER_DISCORD_ID
 
 
 def _read_bounded_int(name: str, default: int, minimum: int, maximum: int) -> int:

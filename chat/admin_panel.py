@@ -171,7 +171,6 @@ def _persist_runtime_config(
     recent_visual_context_window: int | None = None,
 ) -> dict[str, str]:
     updates: dict[str, str] = {}
-    api_config_changed = False
 
     if base_url is not None:
         normalized_url = base_url.strip()
@@ -181,14 +180,12 @@ def _persist_runtime_config(
             cog.client.config.base_url = normalized_url
             os.environ['OPENAI_BASE_URL'] = normalized_url
             updates['OPENAI_BASE_URL'] = normalized_url
-            api_config_changed = True
 
     if api_key is not None:
         normalized_key = api_key.strip()
         cog.client.config.api_key = normalized_key
         os.environ['OPENAI_API_KEY'] = normalized_key
         updates['OPENAI_API_KEY'] = normalized_key
-        api_config_changed = True
 
     if model is not None:
         normalized_model = model.strip()
@@ -198,7 +195,6 @@ def _persist_runtime_config(
             cog.client.config.model = normalized_model
             os.environ['OPENAI_MODEL'] = normalized_model
             updates['OPENAI_MODEL'] = normalized_model
-            api_config_changed = True
 
     if history_limit is not None:
         if history_limit < 1 or history_limit > 1000:
@@ -217,11 +213,6 @@ def _persist_runtime_config(
 
     if updates:
         _write_env_updates(updates)
-        if api_config_changed:
-            fortune_cog = cog.bot.get_cog('DailyFortuneCog')
-            reload_fortune = getattr(fortune_cog, 'reload_client_from_env', None)
-            if callable(reload_fortune):
-                reload_fortune()
         safe_updates = {
             key: ('***' if 'KEY' in key else value)
             for key, value in updates.items()
@@ -243,65 +234,6 @@ async def _reload_agent_chat_runtime_if_needed(
         return False
     await cog.reload_agent_chat_runtime_from_env()
     return True
-
-
-def _persist_draw_router_config(
-    cog: 'AtriChat',
-    *,
-    base_url: str | None = None,
-    api_key: str | None = None,
-    model: str | None = None,
-    temperature: float | None = None,
-    timeout_seconds: int | None = None,
-) -> dict[str, str]:
-    updates: dict[str, str] = {}
-
-    if base_url is not None:
-        normalized_url = base_url.strip()
-        if not normalized_url:
-            raise ValueError('绘图路由 Base URL 不能为空。')
-        os.environ['ATRI_DRAW_ROUTER_BASE_URL'] = normalized_url
-        updates['ATRI_DRAW_ROUTER_BASE_URL'] = normalized_url
-
-    if api_key is not None:
-        normalized_key = api_key.strip()
-        os.environ['ATRI_DRAW_ROUTER_API_KEY'] = normalized_key
-        updates['ATRI_DRAW_ROUTER_API_KEY'] = normalized_key
-
-    if model is not None:
-        normalized_model = model.strip()
-        if not normalized_model:
-            raise ValueError('绘图路由模型不能为空。')
-        os.environ['ATRI_DRAW_ROUTER_MODEL'] = normalized_model
-        updates['ATRI_DRAW_ROUTER_MODEL'] = normalized_model
-
-    if temperature is not None:
-        if temperature < 0.0 or temperature > 2.0:
-            raise ValueError('绘图路由温度需要在 0 到 2 之间。')
-        value = f'{temperature:g}'
-        os.environ['ATRI_DRAW_ROUTER_TEMPERATURE'] = value
-        updates['ATRI_DRAW_ROUTER_TEMPERATURE'] = value
-
-    if timeout_seconds is not None:
-        if timeout_seconds < 5 or timeout_seconds > 300:
-            raise ValueError('绘图路由超时需要在 5 到 300 秒之间。')
-        value = str(timeout_seconds)
-        os.environ['ATRI_DRAW_ROUTER_TIMEOUT'] = value
-        updates['ATRI_DRAW_ROUTER_TIMEOUT'] = value
-
-    if updates:
-        _write_env_updates(updates)
-        cog.draw_agent.reload_router_client_from_env()
-        safe_updates = {
-            key: ('***' if 'KEY' in key else value)
-            for key, value in updates.items()
-        }
-        print(
-            '[INFO] Draw router runtime config updated: '
-            f"{json.dumps(safe_updates, ensure_ascii=False)}"
-        )
-
-    return updates
 
 
 class ChatConfigModal(discord.ui.Modal):
@@ -423,103 +355,6 @@ class ChatConfigModal(discord.ui.Modal):
         except Exception as exc:
             self.panel.error_message = _compact_text(str(exc), 320)
             self.panel.status_message = '配置更新失败，请检查输入内容。'
-            await self.panel.refresh_panel_message()
-
-
-class DrawRouterConfigModal(discord.ui.Modal):
-    def __init__(self, panel: 'ChatAdminView'):
-        super().__init__(title='编辑绘图路由 API', timeout=300)
-        self.panel = panel
-        config = panel.cog.draw_agent.router_client.config
-
-        self.base_url = discord.ui.TextInput(
-            label='绘图路由 Base URL',
-            default=config.base_url or '',
-            placeholder='例如 https://api.openai.com/v1',
-            required=True,
-            max_length=400,
-        )
-        self.api_key = discord.ui.TextInput(
-            label='绘图路由 API Key',
-            default='',
-            placeholder='留空表示保持当前密钥不变',
-            required=False,
-            max_length=400,
-        )
-        self.model = discord.ui.TextInput(
-            label='绘图路由模型',
-            default=config.model or '',
-            placeholder='建议使用快模型，只负责 JSON intent',
-            required=True,
-            max_length=200,
-        )
-        self.temperature = discord.ui.TextInput(
-            label='绘图路由温度',
-            default=f'{config.temperature:g}',
-            placeholder='建议 0.0 到 0.2',
-            required=True,
-            max_length=8,
-        )
-        self.timeout_seconds = discord.ui.TextInput(
-            label='绘图路由超时秒数',
-            default=str(config.timeout_seconds),
-            placeholder='例如 15 或 30',
-            required=True,
-            max_length=4,
-        )
-
-        self.add_item(self.base_url)
-        self.add_item(self.api_key)
-        self.add_item(self.model)
-        self.add_item(self.temperature)
-        self.add_item(self.timeout_seconds)
-
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        if interaction.user.id != self.panel.cog.owner_user_id:
-            await interaction.response.send_message(
-                '这个面板只允许开发者使用。',
-                ephemeral=True,
-            )
-            return
-
-        try:
-            temperature = float(self.temperature.value.strip())
-        except ValueError:
-            await interaction.response.send_message(
-                '绘图路由温度必须是数字。',
-                ephemeral=True,
-            )
-            return
-
-        try:
-            timeout_seconds = int(self.timeout_seconds.value.strip())
-        except ValueError:
-            await interaction.response.send_message(
-                '绘图路由超时必须是整数。',
-                ephemeral=True,
-            )
-            return
-
-        await interaction.response.defer()
-
-        try:
-            updates = _persist_draw_router_config(
-                self.panel.cog,
-                base_url=self.base_url.value,
-                api_key=(self.api_key.value if self.api_key.value.strip() else None),
-                model=self.model.value,
-                temperature=temperature,
-                timeout_seconds=timeout_seconds,
-            )
-            self.panel.error_message = None
-            self.panel.status_message = (
-                '绘图路由 API 已更新并写回 .env，新的意图判断会立即使用。'
-            )
-            if updates:
-                await self.panel.refresh_panel_message()
-        except Exception as exc:
-            self.panel.error_message = _compact_text(str(exc), 320)
-            self.panel.status_message = '绘图路由配置更新失败，请检查输入内容。'
             await self.panel.refresh_panel_message()
 
 
@@ -645,14 +480,6 @@ class ChatAdminView(discord.ui.View):
         refresh_button.callback = self.refresh_models
         self.add_item(refresh_button)
 
-        router_button = discord.ui.Button(
-            label='编辑绘图路由',
-            style=discord.ButtonStyle.secondary,
-            row=1,
-        )
-        router_button.callback = self.open_draw_router_modal
-        self.add_item(router_button)
-
         previous_button = discord.ui.Button(
             label='上一页',
             style=discord.ButtonStyle.secondary,
@@ -719,27 +546,6 @@ class ChatAdminView(discord.ui.View):
             ),
             inline=False,
         )
-        router_config = self.cog.draw_agent.router_client.config
-        router_has_env = any(
-            os.getenv(key, '').strip()
-            for key in (
-                'ATRI_DRAW_ROUTER_BASE_URL',
-                'ATRI_DRAW_ROUTER_API_KEY',
-                'ATRI_DRAW_ROUTER_MODEL',
-            )
-        )
-        embed.add_field(
-            name='绘图路由 API',
-            value=(
-                f'Base URL: `{_compact_text(router_config.base_url or "未设置", 120)}`\n'
-                f'API Key: `{_mask_secret(router_config.api_key)}`\n'
-                f'模型: `{_compact_text(router_config.model or "未选择", 120)}`\n'
-                f'温度/超时: `{router_config.temperature:g}` / `{router_config.timeout_seconds}s`\n'
-                f'来源: `{"独立配置" if router_has_env else "跟随主聊天配置"}`'
-            ),
-            inline=False,
-        )
-
         if self.available_models:
             start = self.model_page * MODEL_PAGE_SIZE + 1
             end = min((self.model_page + 1) * MODEL_PAGE_SIZE, len(self.available_models))
@@ -768,9 +574,6 @@ class ChatAdminView(discord.ui.View):
 
     async def open_config_modal(self, interaction: discord.Interaction) -> None:
         await interaction.response.send_modal(ChatConfigModal(self))
-
-    async def open_draw_router_modal(self, interaction: discord.Interaction) -> None:
-        await interaction.response.send_modal(DrawRouterConfigModal(self))
 
     async def refresh_models(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer()

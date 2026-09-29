@@ -1,5 +1,13 @@
 # ATRI DeepSeek Harness runtime
 
+## 上下文压缩预算
+
+- 普通聊天使用 `atri-token-meter`：ASCII 约 3 字符/token，中文等 BMP 非 ASCII 约 1.2 tokens/字符，补充平面字符约 3 tokens/字符；以最近上游输入用量（含缓存读写）作保守比例校准。这是估算，不是模型专用 tokenizer。
+- 默认在 14 万预算的 78% 左右触发，保留约 2.8 万 **估算 tokens** 的近期完整消息/工具调用对；不是保留 11.2 万字符。独立系统提示和工具 schema 另计。
+- 摘要生成仍最多 3 万 tokens，并按压缩后总目标约 7 万的剩余空间收紧。完成后记录总量估算与是否达标；如果单条消息/完整工具调用对或固定提示过大，会报告超目标，不无限重试或谎报达标。一次自动压力压缩最多请求一次摘要。
+- 恢复历史以独立约 4000 字符的小段注入，保持顺序与历史引用边界，批量落盘。旧版大块恢复记录会在下一次互动时迁移，再尝试一次压缩；原 JSONL 不删除，摘要失败仍保留已注入原文。恢复传输字符上限只作安全防护，不是近期 token 预算。
+- `In` 尾巴是该轮实际请求用量，不会在压缩刚完成时回写成下一轮的输入量；请用压缩后的下一轮输入及 `ATRI compaction budget` 日志验证。
+
 这个目录是 Discord 聊天模块的 DSH 核心，版本锁定在 `0.1.0-rc.6`。Windows 首次安装：
 
 ```powershell
@@ -19,9 +27,9 @@ ATRI_AGENT_CODE_MODEL=your-maintenance-model
 
 所有者可以在 Discord 使用 `/开发agent设置` 打开 ephemeral 面板，填写独立维护 API。Model 默认留空；提交后 Bot 会请求该上游的 `/models`，在面板中以可分页下拉列表选择，也可手动填 Model 作为不支持 `/models` 的兼容兜底。未启用时直接调用 `/改进自己` 也会自动弹出编辑 Modal。配置保存到被 Git 忽略的 `config/credentials/agent_code_api.json`；Bot 会等当前维护任务结束后原子替换维护 DSH 运行时，不重启普通聊天进程。面板配置优先于上面的历史 `.env` 变量。
 
-- 普通 Agent：每个 Discord 服务器一个独立 DSH 进程，每个频道一个独立持久会话；内置 `draw_image` 和 `daily_fortune`，并从 `native-plugins.json` 加载已审计的 DSH 原生工具。
+- 普通 Agent：每个 Discord 服务器一个独立 DSH 进程，每个频道一个独立持久会话；提供 Discord 管理、联网搜索、点歌等工具，并从 `native-plugins.json` 加载已审计的 DSH 原生工具。
 - 聊天白名单服务器中，没有 @/Reply ATRI 的普通频道发言也会按频道 FIFO 持久写入同频道上下文，包括其他 Discord BOT/APP 的文字与 Embed 文本。旁听写入不调用模型、不发送回复、不添加任务反应；ATRI 自己的回复由 DSH 原生 assistant 记录保存，不重复旁听。每次真正互动前，宿主还会按频道持久水位从 Discord 追赶最近漏记的普通发言，补齐 BOT 离线、重启或更新期间的缺口。这些记录与互动消息一起参与 DSH 原生窗口计量和自动压缩。
-- 开发 Agent：所有者既可使用 `/改进自己`，也可在普通聊天中自然提出维护要求，由聊天 Agent 委派给独立维护 Agent。维护过程使用另一套 API、DSH 会话和存储，没有任意 Shell、跨频道发送、Web 或子 Agent 权限。它能反复读取非敏感项目源码，但宿主只允许写入 `config/agent`、`tools/agent`、`tools/draw` 与 `tools/fortune`，核心代码始终只读。
+- 开发 Agent：所有者既可使用 `/改进自己`，也可在普通聊天中自然提出维护要求，由聊天 Agent 委派给独立维护 Agent。维护过程使用另一套 API、DSH 会话和存储，没有任意 Shell、跨频道发送、Web 或子 Agent 权限。它能反复读取非敏感项目源码，但宿主只允许写入 `config/agent` 与 `tools/agent`，核心代码始终只读。
 - 插件优先：维护 Agent 在缺少能力时先搜索 npm，下载到 `plugin_staging` 隔离区，校验 npm SHA-512 完整性并检查安装脚本。只有已审计的官方低权限 `@deepseek-ai/dsh-*` 包才能写入 `native-plugins.json`；Shell、文件系统、任务调度、Cordis 控制、Skill 和子 Agent 类型不会自动激活。
 - 已启用 `@deepseek-ai/dsh-tool-todo`，ATRI 可通过 `todo_write` 维护复杂任务的待做、进行中和已完成层次。
 - 普通聊天的系统提示词包含 ATRI 能力清单。被问到“你能做什么/有什么工具”时，它根据该清单与当轮实际可见的 DSH tool schema 回答，不会为此读取项目文件。实际 schema 始终优先，因此后续激活的原生工具也可被正确识别。
@@ -30,10 +38,12 @@ ATRI_AGENT_CODE_MODEL=your-maintenance-model
 - 维护 Agent 不会把整个仓库塞入提示词：先用 `project_list` 看有界目录，再用 `project_search` 定位符号，最后用 `project_read` 分段读取（单次最多 400 行）。每个维护任务使用新的代码会话，源码和工具结果不会进入普通聊天会话。
 - 两套 DSH 都启用了自动上下文压缩：超大工具结果先做头尾剪枝，达到模型窗口压力阈值后再生成结构化检查点；维护任务的检查点仍只存在于独立代码会话和独立 API 中。
 - 普通聊天把“上游模型能力”和“ATRI 记忆目标”分开：`ATRI_DSH_PROVIDER_CONTEXT_WINDOW` 默认 `1048576`，只供 pi-ai 判断真正的模型溢出；`ATRI_DSH_CONTEXT_WINDOW` 默认 `140000`，控制 ATRI 希望维持的会话规模。DSH 会动态换算压缩比例，仍在记忆目标的 `78%`（约 `109200` tokens）自动压缩，摘要最多生成 `30000` tokens。`/频道上下文` 可对当前服务器/频道热更新独立的楼层数、`8000～80000` tokens 软预算以及“压缩/丢弃最旧”策略，配置保存在 Git 忽略的 `chat/agent/data/channel_contexts.json`。
-- 会话换代不只继承最后一份成功摘要：宿主还会从同一频道旧 JSONL 中提取该摘要之后的用户/助手记录和工具完成标记，过滤当轮宿主元数据并限制在 `40000` 字符内，再用 Discord 近期消息补漏。压缩 API 失败时不会出现“旧摘要到近期消息之间”的完全空档；旧 JSONL 始终保留且不会跨频道读取。
+- 自动压缩和开发者专用的 `/压缩频道上下文` 都保留记忆目标的 `20%`（默认约 `28000` 估算 tokens）近期原文；保留完整工具调用/结果边界，因此不一定恰好是 28000。历史不足时手动压缩不强行缩到只剩一条。上游真正返回上下文溢出时，原生紧急压缩仍可采用更激进策略。
+- 会话换代按 JSONL 的 `surfaceOp` 追加/替换顺序重放有效对话，继承已提交摘要以及**尚未被摘要覆盖**的近期记录；包括摘要产生之前保留下来的尾段。不会仅按摘要时间点截断，不重新带回被摘要替换的旧历史，也不会重放历史工具调用。摘要标记尚未提交替换或摘要失败时，保留原有效记录。恢复的近期文本预算与原生四字符/token估算对齐，默认 `112000` 字符；摘要上限 `120000` 字符，单条对话不再额外截成 4000 字符。超预算仍优先保留最新文本；工具只带轻量完成标记，不包含原始图片或整份工具输出。字符估算不是上游精确 tokenizer。旧 JSONL 始终保留且不会跨频道读取；修复不会自动回灌已经换代的旧会话。
+- `rc.6` 的原生手动压缩写死 `retainTokens=0`，本项目用 `scripts/patch-compaction.mjs` 做 SHA-256 校验的最小补丁，只改手动范围选择，不改维护锁、取消、事务、工具配对、自动压缩或落盘流程。`npm ci` 的 postinstall 自动应用；已有安装运行 `npm run patch:compaction`。普通聊天启动时 `atri-compaction` 校验补丁，依赖升级不匹配会明确报错，不能悄悄恢复错误行为。
 - `/导入频道上下文 楼层:300` 会在执行命令的当前频道读取最近 300 条可见消息并追加到该频道的 DSH 会话；超出软预算时按频道策略压缩旧记录或舍弃最旧记录。命令只允许所有者在聊天白名单服务器中使用，导入结果仅以 ephemeral 消息显示。
 - 文字与视觉消息统一进入同一个 DSH 频道会话。附件、静态/动态贴纸、GIF/APNG/WebP 等动画图片以及静态/动态自定义表情仍复用 Discord 宿主的下载、格式归一化、压缩和多帧预览逻辑；视觉模型只生成观察笔记，图片 Base64 不写进 DSH 长期会话。
-- `discord_visual_inspect` 可在需要时另行读取当前服务器成员头像、当前/指定消息附件、表情或贴纸。它是通用视觉工具，可用于描述、OCR、比较、风格/外观特征提取；只有用户确实要画图时，Agent 才把提取结果交给 `draw_image`。原始图像字节只进入当次视觉 API 请求。
+- `discord_visual_inspect` 可在需要时另行读取当前服务器成员头像、当前/指定消息附件、表情或贴纸。它是通用视觉工具，可用于描述、OCR、比较、风格/外观特征提取；绘图模块已移除，不再生成图片。原始图像字节只进入当次视觉 API 请求。
 - `discord_manage` 已覆盖服务器表情、应用表情和服务器贴纸的创建/修改/删除；创建素材可来自当前附件、指定消息附件、成员头像、已有表情/贴纸或公网素材 URL。直链图片/GIF 可直接使用，普通网页也会尝试读取 Open Graph/Twitter 图片元数据。外链仅下载到内存，且会拒绝本机/内网/保留地址、内网重定向、超时、非图像与超限文件。超过 Discord 限制时会在内存中自动逐级缩小、降色，动画还会抽帧并合并被跳过帧的时长；表情保留为 GIF，贴纸转为 APNG，上传完不会留下本地素材文件。这些写操作仅开放给所有者。删除、清理、踢出和封禁等破坏性操作会把 `atri_maozhua` 直接加到所有者当前的指令消息上，不另发确认消息；宿主同时校验该指令消息 ID、表情 ID 和点击者 Discord ID，只有配置的所有者本人在超时前点击才会执行，无需再发文字“确认删除”。Discord Reply 的目标频道/消息 ID 由宿主每轮直接注入，Agent 必须直接使用，不得再要求用户粘贴消息链接。
 - 所有者可用 `/清理缓存` 先预览、再确认清理，也可让 Agent 先调用 `cleanup_preview` 后再执行 `cleanup_generated_files`，后者会进入猫爪 reaction 确认。清理器没有任意路径参数，只识别过期的 `music_cache` 音频产物、`bilibili_cache/bilibili_*`、`douyin_cache/douyin_*`临时任务目录以及 ATRI/F2 轮转日志。正在下载/播放的文件、当前 `bot.log`/`bot.err.log`、配置、凭据、数据库、Agent 会话与用户文件都不在删除范围。
 - 普通聊天回复统一追加 `Time / In / Out` 小尾巴；视觉轮次会合计视觉桥接与 DSH 的 Token 用量。DSH 失败时不会再悄悄切换回另一套聊天记忆。
@@ -42,10 +52,10 @@ ATRI_AGENT_CODE_MODEL=your-maintenance-model
 - JSON-RPC 入口使用项目内 `atri-sdk-jsonrpc-server` 恢复适配器：进程重启后，已存在的频道 sessionId 会调用 DSH 原生 `agents.resume()`；新频道才调用 `agents.create()`，避免官方 demo 对已有 JSONL 日志重复创建导致失忆或回退。
 - DSH stdout 是逐行 JSON-RPC，Python 桥默认把单帧安全上限设为 8 MiB（`ATRI_DSH_STDIO_LIMIT_BYTES` 可在 256 KiB～32 MiB 间覆盖），避免 asyncio 默认 64 KiB 在长工具 schema/事件上触发 `LimitOverrunError`；真正超过安全上限时会受控回收该 DSH 进程，而不是留下未处理的 reader task 异常。
 
-代码模式只会直接修改专用配置区和工具区，不会重启 Bot、提交 Git 或读取 `.env`、Cookie、Token、日志和运行数据。`tools/draw` 与 `tools/fortune` 是已接入能力；如果找不到可复用插件，创建新的 `.py` / `.js` 工具源码必须由所有者在当次维护请求中明确确认。修改后仍需检查 Git diff、测试并手动重启。
+代码模式只会直接修改专用配置区和工具区，不会重启 Bot、提交 Git 或读取 `.env`、Cookie、Token、日志和运行数据。如果找不到可复用插件，创建新的 `.py` / `.js` 工具源码必须由所有者在当次维护请求中明确确认。修改后仍需检查 Git diff、测试并手动重启。
 
 QQ 音乐、B 站和抖音的 Cookie 统一保存在 `config/credentials`。所有凭据文件均被 Git 忽略；维护 Agent 只能通过 `credential_update` 覆盖所有者在当次任务中提供的新值，无法读回旧值或通过通用项目工具搜索该目录。写入使用原子替换，随后请求对应 Cog 热加载。
 
 聊天请求在每个 Discord 频道内严格 FIFO：后到的消息会先获得 `ATRI_dangji` 反应，等同频道前一条任务完整结束后再开始 typing 和模型调用。不同频道互不阻塞。
 
-消息仍会发给 `.env` 中配置的模型服务；画图提示词会发给 NovelAI。若模型服务不承诺零保留，请不要把“本地隔离”理解成“第三方永远看不到消息”。
+消息仍会发给 `.env` 中配置的模型服务。若模型服务不承诺零保留，请不要把“本地隔离”理解成“第三方永远看不到消息”。

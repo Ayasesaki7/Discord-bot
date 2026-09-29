@@ -1,6 +1,7 @@
 ﻿import asyncio
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import discord
@@ -20,6 +21,30 @@ if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8', errors='backslashreplace')
 if hasattr(sys.stderr, 'reconfigure'):
     sys.stderr.reconfigure(encoding='utf-8', errors='backslashreplace')
+
+
+class TimestampedStream:
+    """Prefix every output line with local time; systemd appends to plain files."""
+
+    def __init__(self, stream) -> None:
+        self._stream = stream
+        self._line_start = True
+
+    def write(self, text: str) -> int:
+        if not text:
+            return 0
+        stamp = datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S%z ')
+        parts = []
+        for line in text.splitlines(keepends=True):
+            if self._line_start:
+                parts.append(stamp)
+            parts.append(line)
+            self._line_start = line.endswith('\n')
+        self._stream.write(''.join(parts))
+        return len(text)
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
 
 
 class SilentGlobalBlacklist(commands.CheckFailure):
@@ -58,9 +83,7 @@ class MusicBot(commands.Bot):
             ),
         )
         self.test_guild_id = self._parse_test_guild_id(os.getenv('TEST_GUILD_ID'))
-        self.punishment_guild_id = self._parse_optional_guild_id(
-            'PUNISHMENT_GUILD_ID'
-        )
+        self.punishment_guild_id = self._parse_optional_guild_id('PUNISHMENT_GUILD_ID')
         self.global_blacklist_ids = read_global_blacklist_ids()
         self.add_check(self._global_prefix_command_check)
 
@@ -100,14 +123,11 @@ class MusicBot(commands.Bot):
         await self.load_extension('global_blacklist')
         await self.load_extension('music')
         await self.load_extension('chat')
-        await self.load_extension('fortune')
         await self.load_extension('roles')
         await self.load_extension('bilibili')
         await self.load_extension('douyin')
         if self.punishment_guild_id:
             await self.load_extension('punishments')
-        else:
-            print('[INFO] Punishment extension disabled: PUNISHMENT_GUILD_ID is not set')
         await self.load_extension('system_admin')
 
         if self.test_guild_id:
@@ -159,5 +179,7 @@ async def main() -> None:
 
 
 if __name__ == '__main__':
+    sys.stdout = TimestampedStream(sys.stdout)
+    sys.stderr = TimestampedStream(sys.stderr)
     asyncio.run(main())
 

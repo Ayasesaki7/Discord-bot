@@ -39,8 +39,6 @@ _BLOCKED_FILE_PATTERNS = (
 _ALLOWED_DOTENV_FILES = {".env.example"}
 _WRITABLE_CONFIG_ROOT = Path("config/agent")
 _WRITABLE_AGENT_TOOL_ROOT = Path("tools/agent")
-_WRITABLE_DRAW_TOOL_ROOT = Path("tools/draw")
-_WRITABLE_FORTUNE_TOOL_ROOT = Path("tools/fortune")
 _WRITABLE_SUFFIXES_BY_ROOT = {
     _WRITABLE_CONFIG_ROOT: {".json", ".yaml", ".yml", ".toml", ".txt", ".md"},
     _WRITABLE_AGENT_TOOL_ROOT: {
@@ -48,24 +46,6 @@ _WRITABLE_SUFFIXES_BY_ROOT = {
         ".js",
         ".mjs",
         ".cjs",
-        ".json",
-        ".yaml",
-        ".yml",
-        ".toml",
-        ".txt",
-        ".md",
-    },
-    _WRITABLE_DRAW_TOOL_ROOT: {
-        ".py",
-        ".json",
-        ".yaml",
-        ".yml",
-        ".toml",
-        ".txt",
-        ".md",
-    },
-    _WRITABLE_FORTUNE_TOOL_ROOT: {
-        ".py",
         ".json",
         ".yaml",
         ".yml",
@@ -450,7 +430,7 @@ class ProjectToolHost:
             return
         raise ProjectToolError(
             "core project files are read-only; writes are allowed only under "
-            "config/agent, tools/agent, tools/draw, or tools/fortune"
+            "config/agent or tools/agent"
         )
 
     def _read_text(self, path: Path) -> str:

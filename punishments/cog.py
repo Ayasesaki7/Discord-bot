@@ -24,9 +24,7 @@ def _read_discord_id(name: str) -> int:
 
 
 PUNISHMENT_GUILD_ID = _read_discord_id('PUNISHMENT_GUILD_ID')
-PUNISHMENT_ANNOUNCE_CHANNEL_ID = _read_discord_id(
-    'PUNISHMENT_ANNOUNCE_CHANNEL_ID'
-)
+PUNISHMENT_ANNOUNCE_CHANNEL_ID = _read_discord_id('PUNISHMENT_ANNOUNCE_CHANNEL_ID')
 BAN_COLOR = discord.Color.from_rgb(239, 75, 75)
 REVOKE_COLOR = discord.Color.from_rgb(67, 181, 129)
 

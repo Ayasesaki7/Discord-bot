@@ -7,9 +7,6 @@ import time
 
 failed_once_sessions: set[str] = set()
 wedged_sessions: set[str] = set()
-injected_by_session: dict[str, list[str]] = {}
-personas_by_session: dict[str, str] = {}
-contexts_by_session: dict[str, str] = {}
 
 
 def send(payload: dict[str, object]) -> None:
@@ -39,7 +36,6 @@ for raw_line in sys.stdin:
     if method == "session/prompt":
         session_id = params["sessionId"]
         text = params["contentBlocks"][0]["text"]
-        injected = injected_by_session.pop(session_id, [])
         if text == "fail-once-until-cancel":
             if session_id not in failed_once_sessions:
                 failed_once_sessions.add(session_id)
@@ -56,46 +52,9 @@ for raw_line in sys.stdin:
                     }
                 )
                 continue
-        reply = (
-            f"context:{'|'.join(injected)}"
-            if text == "show-injected"
-            else (
-                f"persona:{personas_by_session.get(session_id, '')}"
-                if text == "show-persona"
-                else (
-                    f"context-var:{contexts_by_session.get(session_id, '')}"
-                    if text == "show-context-var"
-                    else f"echo:{text}"
-                )
-            )
-        )
-        if text == "oversized-jsonrpc-frame":
-            reply = "x" * 100_000
+        reply = f"echo:{text}"
         send({"jsonrpc": "2.0", "id": request_id, "result": {"messageId": "m-1"}})
         send({"method": "session.status", "params": {"sessionId": session_id, "status": "running"}})
-        if text == "provider-context-overflow":
-            send(
-                {
-                    "method": "session.event",
-                    "params": {
-                        "sessionId": session_id,
-                        "event": {
-                            "type": "turn/end",
-                            "data": {
-                                "reason": {
-                                    "kind": "error",
-                                    "error": {
-                                        "message": "simulated context overflow",
-                                        "code": "CONTEXT_WINDOW_EXCEEDED",
-                                    },
-                                }
-                            },
-                        },
-                    },
-                }
-            )
-            send({"method": "session.status", "params": {"sessionId": session_id, "status": "idle"}})
-            continue
         if text == "hang-until-cancelled":
             continue
         if text == "idle-before-turn-end":
@@ -193,59 +152,6 @@ for raw_line in sys.stdin:
             }
         )
         send({"method": "session.status", "params": {"sessionId": session_id, "status": "idle"}})
-        continue
-    if method == "session/inject":
-        session_id = params["sessionId"]
-        text = params["contentBlocks"][0]["text"]
-        pending = injected_by_session.setdefault(session_id, [])
-        pending.append(text)
-        send(
-            {
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "result": {
-                    "sessionId": session_id,
-                    "messageId": f"injected-{len(pending)}",
-                    "eventSeq": len(pending),
-                    "recorded": True,
-                },
-            }
-        )
-        continue
-    if method == "session/persona":
-        session_id = params["sessionId"]
-        persona = params["persona"]
-        changed = personas_by_session.get(session_id) != persona
-        personas_by_session[session_id] = persona
-        send(
-            {
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "result": {
-                    "sessionId": session_id,
-                    "configured": True,
-                    "changed": changed,
-                    "recycled": changed,
-                },
-            }
-        )
-        continue
-    if method == "session/context":
-        session_id = params["sessionId"]
-        context = params["context"]
-        changed = contexts_by_session.get(session_id) != context
-        contexts_by_session[session_id] = context
-        send(
-            {
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "result": {
-                    "sessionId": session_id,
-                    "configured": True,
-                    "changed": changed,
-                },
-            }
-        )
         continue
     if method == "session/cancel":
         wedged_sessions.discard(params["sessionId"])

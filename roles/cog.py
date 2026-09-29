@@ -31,17 +31,12 @@ class RoleClaimGuildConfig:
     roles: tuple[RoleClaimOption, ...]
 
 
-EMPTY_ROLE_CLAIM_CONFIG = RoleClaimGuildConfig(
-    guild_id=0,
-    manager_role_id=0,
-    roles=(),
-)
+EMPTY_ROLE_CLAIM_CONFIG = RoleClaimGuildConfig(0, 0, ())
 
 
 def _read_positive_id(name: str) -> int:
-    raw = os.getenv(name, '').strip()
     try:
-        value = int(raw)
+        value = int(os.getenv(name, '').strip())
     except ValueError:
         return 0
     return value if value > 0 else 0
@@ -53,7 +48,6 @@ def _read_role_claim_configs() -> dict[int, RoleClaimGuildConfig]:
     raw_options = os.getenv('ROLE_CLAIM_OPTIONS_JSON', '').strip()
     if not guild_id or not manager_role_id or not raw_options:
         return {}
-
     try:
         payload = json.loads(raw_options)
     except json.JSONDecodeError as exc:
@@ -62,7 +56,6 @@ def _read_role_claim_configs() -> dict[int, RoleClaimGuildConfig]:
     if not isinstance(payload, list):
         print('[WARN] ROLE_CLAIM_OPTIONS_JSON must be a JSON list')
         return {}
-
     options: list[RoleClaimOption] = []
     for item in payload[:ROLE_SELECT_LIMIT]:
         if not isinstance(item, dict):
@@ -74,25 +67,11 @@ def _read_role_claim_configs() -> dict[int, RoleClaimGuildConfig]:
             role_id = int(item.get('role_id', 0))
         except (TypeError, ValueError):
             continue
-        if not key or not label or role_id <= 0:
-            continue
-        options.append(
-            RoleClaimOption(
-                key=key[:100],
-                label=label[:100],
-                role_id=role_id,
-                description=(description or label)[:100],
-            )
-        )
-
+        if key and label and role_id > 0:
+            options.append(RoleClaimOption(key[:100], label[:100], role_id, (description or label)[:100]))
     if not options:
         return {}
-    config = RoleClaimGuildConfig(
-        guild_id=guild_id,
-        manager_role_id=manager_role_id,
-        roles=tuple(options),
-    )
-    return {guild_id: config}
+    return {guild_id: RoleClaimGuildConfig(guild_id, manager_role_id, tuple(options))}
 
 
 ROLE_CLAIM_GUILD_CONFIGS = _read_role_claim_configs()
@@ -183,10 +162,7 @@ class RoleClaimCog(commands.Cog):
 
     @property
     def default_config(self) -> RoleClaimGuildConfig:
-        return next(
-            iter(ROLE_CLAIM_GUILD_CONFIGS.values()),
-            EMPTY_ROLE_CLAIM_CONFIG,
-        )
+        return next(iter(ROLE_CLAIM_GUILD_CONFIGS.values()), EMPTY_ROLE_CLAIM_CONFIG)
 
     def get_config(self, guild_id: int | None) -> RoleClaimGuildConfig | None:
         if guild_id is None:

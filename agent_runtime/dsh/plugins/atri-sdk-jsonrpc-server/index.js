@@ -131,35 +131,39 @@ export class AtriResumableHarnessSdkServer extends HarnessSdkJsonRpcServer {
     }
     if (method === 'session/inject') {
       const sessionId = params?.sessionId
-      const contentBlocks = params?.contentBlocks
+      const messages = params?.messages ?? [params?.contentBlocks]
       if (typeof sessionId !== 'string' || sessionId.length === 0) {
         throw new TypeError('session/inject requires a non-empty sessionId')
       }
       if (
-        !Array.isArray(contentBlocks)
-        || contentBlocks.length === 0
-        || contentBlocks.some((block) => (
+        !Array.isArray(messages) || messages.length === 0 || messages.length > 512
+        || messages.some(contentBlocks => !Array.isArray(contentBlocks) || contentBlocks.length === 0 || contentBlocks.some((block) => (
           block === null
           || typeof block !== 'object'
           || block.type !== 'text'
           || typeof block.text !== 'string'
           || block.text.length === 0
-        ))
+        )))
       ) {
         throw new TypeError('session/inject requires non-empty text contentBlocks')
       }
       const rec = await this.getOrCreateSession(sessionId)
-      const message = createUserMessage({
-        content: contentBlocks,
-        source: {
-          kind: 'plugin',
-          plugin: 'atri-passive-discord',
-          form: 'recall',
-        },
-      })
-      const event = rec.handle.agent.session.append('user/message', message, {
-        surfaceOp: 'append',
-      })
+      // Validate the entire batch first, append without yielding, then flush
+      // once. Each frame is its own surface node, not blocks of one giant node.
+      let message, event
+      for (const contentBlocks of messages) {
+        message = createUserMessage({
+          content: contentBlocks,
+          source: {
+            kind: 'plugin',
+            plugin: 'atri-passive-discord',
+            form: 'recall',
+          },
+        })
+        event = rec.handle.agent.session.append('user/message', message, {
+          surfaceOp: 'append',
+        })
+      }
       // Passive channel speech has no turn/end checkpoint, so explicitly wait
       // for the session store's durability barrier before acknowledging it.
       await this.ctx.sessions.flush(rec.handle.agent.session)
@@ -168,6 +172,7 @@ export class AtriResumableHarnessSdkServer extends HarnessSdkJsonRpcServer {
         messageId: message.id,
         eventSeq: event.seq,
         recorded: true,
+        messageCount: messages.length,
       }
     }
     if (method === 'session/compact') {

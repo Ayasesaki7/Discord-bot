@@ -13,12 +13,9 @@ from .dsh_runtime import DshRuntimeError, describe_dsh_error
 from .project_tools import ProjectToolError
 
 
-DrawHandler = Callable[[dict[str, object]], Awaitable[dict[str, object]]]
 ProjectHandler = Callable[[str, dict[str, object]], Awaitable[dict[str, object]]]
 DiscordHandler = Callable[[str, dict[str, object]], Awaitable[dict[str, object]]]
-DrawProfileHandler = Callable[[dict[str, object]], Awaitable[dict[str, object]]]
 MaintenanceHandler = Callable[[str], Awaitable[dict[str, object]]]
-FortuneHandler = Callable[[], Awaitable[dict[str, object]]]
 
 
 @dataclass(slots=True)
@@ -40,13 +37,10 @@ class AgentToolServer:
         self._site: web.TCPSite | None = None
         self._endpoint = ""
         self._start_lock = asyncio.Lock()
-        self._bindings: dict[str, DrawHandler] = {}
         self._project_bindings: dict[str, ProjectHandler] = {}
         self._discord_bindings: dict[str, DiscordHandler] = {}
-        self._draw_profile_bindings: dict[str, DrawProfileHandler] = {}
         self._maintenance_bindings: dict[str, MaintenanceHandler] = {}
         self._maintenance_jobs: dict[str, _MaintenanceJob] = {}
-        self._fortune_bindings: dict[str, FortuneHandler] = {}
         self._active_session_tasks: dict[str, set[asyncio.Task[object]]] = {}
         self._bindings_lock = asyncio.Lock()
 
@@ -65,16 +59,13 @@ class AgentToolServer:
             if self._runner is not None:
                 return
             app = web.Application(client_max_size=64 * 1024)
-            app.router.add_post("/v1/tools/draw-image", self._handle_draw_image)
             app.router.add_post("/v1/tools/project", self._handle_project)
             app.router.add_post("/v1/tools/discord", self._handle_discord)
-            app.router.add_post("/v1/tools/draw-profile", self._handle_draw_profile)
             app.router.add_post("/v1/tools/improve-self", self._handle_improve_self)
             app.router.add_post(
                 "/v1/tools/improve-self/status",
                 self._handle_improve_self_status,
             )
-            app.router.add_post("/v1/tools/daily-fortune", self._handle_daily_fortune)
             runner = web.AppRunner(app, access_log=None)
             await runner.setup()
             site = web.TCPSite(runner, host="127.0.0.1", port=0)
@@ -99,12 +90,9 @@ class AgentToolServer:
             self._site = None
             self._endpoint = ""
             async with self._bindings_lock:
-                self._bindings.clear()
                 self._project_bindings.clear()
                 self._discord_bindings.clear()
-                self._draw_profile_bindings.clear()
                 self._maintenance_bindings.clear()
-                self._fortune_bindings.clear()
                 maintenance_tasks = [job.task for job in self._maintenance_jobs.values()]
                 self._maintenance_jobs.clear()
                 session_tasks = [
@@ -120,25 +108,6 @@ class AgentToolServer:
                 await asyncio.gather(*all_tasks, return_exceptions=True)
             if runner is not None:
                 await runner.cleanup()
-
-    @asynccontextmanager
-    async def bind_draw_turn(
-        self,
-        session_id: str,
-        handler: DrawHandler,
-    ) -> AsyncIterator[None]:
-        if not session_id:
-            raise ValueError("session_id is required")
-        async with self._bindings_lock:
-            if session_id in self._bindings:
-                raise AgentToolServerError("a draw handler is already bound to this session")
-            self._bindings[session_id] = handler
-        try:
-            yield
-        finally:
-            async with self._bindings_lock:
-                if self._bindings.get(session_id) is handler:
-                    self._bindings.pop(session_id, None)
 
     @asynccontextmanager
     async def bind_project_turn(
@@ -179,25 +148,6 @@ class AgentToolServer:
                     self._discord_bindings.pop(session_id, None)
 
     @asynccontextmanager
-    async def bind_draw_profile_turn(
-        self,
-        session_id: str,
-        handler: DrawProfileHandler,
-    ) -> AsyncIterator[None]:
-        if not session_id:
-            raise ValueError("session_id is required")
-        async with self._bindings_lock:
-            if session_id in self._draw_profile_bindings:
-                raise AgentToolServerError("a draw-profile handler is already bound to this session")
-            self._draw_profile_bindings[session_id] = handler
-        try:
-            yield
-        finally:
-            async with self._bindings_lock:
-                if self._draw_profile_bindings.get(session_id) is handler:
-                    self._draw_profile_bindings.pop(session_id, None)
-
-    @asynccontextmanager
     async def bind_maintenance_turn(
         self,
         session_id: str,
@@ -217,52 +167,6 @@ class AgentToolServer:
             async with self._bindings_lock:
                 if self._maintenance_bindings.get(session_id) is handler:
                     self._maintenance_bindings.pop(session_id, None)
-
-    @asynccontextmanager
-    async def bind_fortune_turn(
-        self,
-        session_id: str,
-        handler: FortuneHandler,
-    ) -> AsyncIterator[None]:
-        if not session_id:
-            raise ValueError("session_id is required")
-        async with self._bindings_lock:
-            if session_id in self._fortune_bindings:
-                raise AgentToolServerError("a fortune handler is already bound to this session")
-            self._fortune_bindings[session_id] = handler
-        try:
-            yield
-        finally:
-            async with self._bindings_lock:
-                if self._fortune_bindings.get(session_id) is handler:
-                    self._fortune_bindings.pop(session_id, None)
-
-    async def _handle_draw_image(self, request: web.Request) -> web.Response:
-        authorization = request.headers.get("Authorization", "")
-        expected = f"Bearer {self._token}"
-        if not hmac.compare_digest(authorization, expected):
-            raise web.HTTPUnauthorized()
-        try:
-            payload = await request.json()
-        except Exception as exc:
-            raise web.HTTPBadRequest(text="invalid JSON") from exc
-        if not isinstance(payload, dict):
-            raise web.HTTPBadRequest(text="request must be an object")
-        session_id = payload.get("sessionId")
-        arguments = payload.get("arguments")
-        if not isinstance(session_id, str) or not isinstance(arguments, dict):
-            raise web.HTTPBadRequest(text="invalid tool request")
-        async with self._bindings_lock:
-            handler = self._bindings.get(session_id)
-        if handler is None:
-            raise web.HTTPForbidden(text="session has no active Discord turn")
-        try:
-            result = await self._run_session_call(session_id, handler(dict(arguments)))
-        except Exception as exc:
-            raise web.HTTPInternalServerError(text="draw execution failed") from exc
-        if not isinstance(result, dict):
-            raise web.HTTPInternalServerError(text="draw handler returned an invalid result")
-        return web.json_response(result)
 
     async def _handle_project(self, request: web.Request) -> web.Response:
         self._require_authorization(request)
@@ -325,28 +229,6 @@ class AgentToolServer:
             raise web.HTTPBadRequest(text=detail) from exc
         if not isinstance(result, dict):
             raise web.HTTPInternalServerError(text="Discord handler returned an invalid result")
-        return web.json_response(result)
-
-    async def _handle_draw_profile(self, request: web.Request) -> web.Response:
-        self._require_authorization(request)
-        try:
-            payload = await request.json()
-        except Exception as exc:
-            raise web.HTTPBadRequest(text="invalid JSON") from exc
-        session_id = payload.get("sessionId") if isinstance(payload, dict) else None
-        arguments = payload.get("arguments", {}) if isinstance(payload, dict) else None
-        if not isinstance(session_id, str) or not isinstance(arguments, dict):
-            raise web.HTTPBadRequest(text="invalid draw-profile request")
-        async with self._bindings_lock:
-            handler = self._draw_profile_bindings.get(session_id)
-        if handler is None:
-            raise web.HTTPForbidden(text="session has no active draw-profile turn")
-        try:
-            result = await self._run_session_call(session_id, handler(dict(arguments)))
-        except Exception as exc:
-            raise web.HTTPInternalServerError(text="draw-profile lookup failed") from exc
-        if not isinstance(result, dict):
-            raise web.HTTPInternalServerError(text="draw-profile handler returned an invalid result")
         return web.json_response(result)
 
     async def _handle_improve_self(self, request: web.Request) -> web.Response:
@@ -445,29 +327,6 @@ class AgentToolServer:
                 "reviewRequired": True,
             }
         return result
-
-    async def _handle_daily_fortune(self, request: web.Request) -> web.Response:
-        self._require_authorization(request)
-        try:
-            payload = await request.json()
-        except Exception as exc:
-            raise web.HTTPBadRequest(text="invalid JSON") from exc
-        if not isinstance(payload, dict):
-            raise web.HTTPBadRequest(text="request must be an object")
-        session_id = payload.get("sessionId")
-        if not isinstance(session_id, str):
-            raise web.HTTPBadRequest(text="invalid tool request")
-        async with self._bindings_lock:
-            handler = self._fortune_bindings.get(session_id)
-        if handler is None:
-            raise web.HTTPForbidden(text="session has no active Discord fortune turn")
-        try:
-            result = await self._run_session_call(session_id, handler())
-        except Exception as exc:
-            raise web.HTTPInternalServerError(text="fortune generation failed") from exc
-        if not isinstance(result, dict):
-            raise web.HTTPInternalServerError(text="fortune handler returned an invalid result")
-        return web.json_response(result)
 
     def _require_authorization(self, request: web.Request) -> None:
         authorization = request.headers.get("Authorization", "")

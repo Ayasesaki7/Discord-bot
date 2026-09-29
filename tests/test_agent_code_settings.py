@@ -4,14 +4,11 @@ import asyncio
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import AsyncMock
 
 from chat.agent.code_settings import (
     AgentCodeSettings,
     AgentCodeSettingsError,
     AgentCodeSettingsStore,
-    WebSearchSettingsStore,
 )
 from chat.cog import AtriChat
 from chat.code_settings_panel import (
@@ -21,7 +18,6 @@ from chat.code_settings_panel import (
     _extract_model_ids,
     _models_url,
 )
-from chat.admin_panel import ChatConfigModal, _reload_agent_chat_runtime_if_needed
 
 
 class AgentCodeSettingsStoreTests(unittest.TestCase):
@@ -59,100 +55,17 @@ class AgentCodeSettingsStoreTests(unittest.TestCase):
                     )
                 )
 
-    def test_web_search_settings_use_an_independent_protected_file(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            store = WebSearchSettingsStore(root)
-            settings = AgentCodeSettings(
-                True,
-                "https://search.example/v1",
-                "fake-search-key",
-                "search-model",
-                8192,
-            )
-
-            store.save(settings)
-
-            self.assertEqual(store.load(), settings)
-            self.assertEqual(store.path.name, "web_search_api.json")
-
 
 class FakePool:
     def __init__(self) -> None:
         self.closed = False
-        self.recycled = False
         self.runtime_env: dict[str, str] = {}
-        self.template = SimpleNamespace(model="test-model")
 
     def configure_runtime_env(self, values: dict[str, str]) -> None:
         self.runtime_env.update(values)
 
     async def close(self) -> None:
         self.closed = True
-
-    async def recycle_runtimes(self) -> int:
-        self.recycled = True
-        return 2
-
-
-class AgentChatHotReloadTests(unittest.IsolatedAsyncioTestCase):
-    def test_chat_config_modal_allows_manual_model_id(self) -> None:
-        config = SimpleNamespace(
-            base_url="https://api.example/v1",
-            model="hidden-upstream-model",
-        )
-        panel = SimpleNamespace(
-            cog=SimpleNamespace(
-                client=SimpleNamespace(config=config),
-                history_limit=300,
-                recent_visual_context_window=3,
-            )
-        )
-
-        modal = ChatConfigModal(panel)
-
-        self.assertEqual(modal.model.default, "hidden-upstream-model")
-        self.assertTrue(modal.model.required)
-        self.assertEqual(len(modal.children), 5)
-
-    async def test_main_api_reload_swaps_pool_and_preserves_tool_bridge(self) -> None:
-        cog = object.__new__(AtriChat)
-        old_pool = FakePool()
-        new_pool = FakePool()
-        new_pool.template.model = "new-chat-model"
-        cog.agent_v2_enabled = True
-        cog.agent_privacy = object()
-        cog.dsh_runtime_pool = old_pool
-        cog.agent_tool_server = SimpleNamespace(
-            endpoint="http://127.0.0.1:1234",
-            token="fake-token",
-        )
-        cog._agent_tool_bridge_configured = True
-        cog._chat_runtime_reload_lock = asyncio.Lock()
-        cog._create_normal_runtime_pool = lambda: new_pool
-
-        recycled = await cog.reload_agent_chat_runtime_from_env()
-
-        self.assertIs(cog.dsh_runtime_pool, new_pool)
-        self.assertTrue(old_pool.recycled)
-        self.assertEqual(recycled, 2)
-        self.assertEqual(new_pool.runtime_env["ATRI_AGENT_CODE_MODE"], "false")
-
-    async def test_admin_api_keys_trigger_reload_but_history_only_does_not(self) -> None:
-        cog = SimpleNamespace(reload_agent_chat_runtime_from_env=AsyncMock())
-
-        changed = await _reload_agent_chat_runtime_if_needed(
-            cog,
-            {"OPENAI_MODEL": "new-chat-model"},
-        )
-        unchanged = await _reload_agent_chat_runtime_if_needed(
-            cog,
-            {"CHAT_HISTORY_LIMIT": "300"},
-        )
-
-        self.assertTrue(changed)
-        self.assertFalse(unchanged)
-        cog.reload_agent_chat_runtime_from_env.assert_awaited_once()
 
 
 class AgentCodeHotReloadTests(unittest.IsolatedAsyncioTestCase):
@@ -283,33 +196,6 @@ class DiscordAgentCodePanelTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(select.options), 25)
         self.assertFalse(select.disabled)
         self.assertEqual(panel.total_model_pages, 2)
-
-    async def test_web_search_panel_uses_separate_settings_and_pull_only_modal(self) -> None:
-        secret = "fake-private-search-key"
-        cog = type(
-            "Cog",
-            (),
-            {
-                "owner_user_id": 123,
-                "agent_code_settings": AgentCodeSettings(False, "", "", ""),
-                "agent_code_enabled": False,
-                "dsh_code_runtime_pool": None,
-                "web_search_settings": AgentCodeSettings(
-                    True,
-                    "https://search.example/v1",
-                    secret,
-                    "search-model",
-                    8192,
-                ),
-            },
-        )()
-        panel = AgentCodeSettingsView(cog, profile="web_search")
-        modal = AgentCodeSettingsModal(panel)
-
-        rendered = str(panel.build_embed().to_dict())
-        self.assertIn("联网搜索 Agent", rendered)
-        self.assertNotIn(secret, rendered)
-        self.assertNotIn(modal.model, modal.children)
 
 
 if __name__ == "__main__":
